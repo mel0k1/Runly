@@ -253,3 +253,45 @@ fn dataset_helpers_behave() {
     assert_eq!(batches.iter().map(|b| b.len()).sum::<usize>(), 10);
     assert_eq!(batches.len(), 4);
 }
+
+#[test]
+fn adam_weight_decay_matches_reference() -> Result<()> {
+    let device = Device::Cpu;
+    let w = Var::new(1.0f32, &device)?;
+    let config = AdamConfig {
+        lr: 0.05,
+        weight_decay: 0.1,
+        ..Default::default()
+    };
+    let mut opt = Adam::new(vec![w.clone()], config)?;
+    let loss = (w.as_tensor() - 3f64)?.sqr()?;
+    let grads = loss.backward()?;
+    opt.step(&grads)?;
+    let got = w.as_tensor().to_scalar::<f32>()? as f64;
+    let g: f64 = -4.0 + 0.1;
+    let m_hat = 0.1 * g / (1.0 - 0.9);
+    let v_hat = 0.001 * g * g / (1.0 - 0.999);
+    let expected = 1.0 - 0.05 * (m_hat / (v_hat.sqrt() + 1e-8));
+    assert!((got - expected).abs() < 1e-5, "{got} vs {expected}");
+    Ok(())
+}
+
+#[test]
+fn adam_weight_decay_pulls_weight_to_zero() -> Result<()> {
+    let device = Device::Cpu;
+    let w = Var::new(0.5f32, &device)?;
+    let config = AdamConfig {
+        lr: 0.01,
+        weight_decay: 1.0,
+        ..Default::default()
+    };
+    let mut opt = Adam::new(vec![w.clone()], config)?;
+    let loss = w.as_tensor().sqr()?;
+    for _ in 0..50 {
+        let grads = loss.backward()?;
+        opt.step(&grads)?;
+    }
+    let got = w.as_tensor().to_scalar::<f32>()? as f64;
+    assert!(got < 0.5, "weight {got} did not shrink");
+    Ok(())
+}

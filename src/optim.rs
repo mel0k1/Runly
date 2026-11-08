@@ -8,6 +8,7 @@ pub struct AdamConfig {
     pub beta1: f64,
     pub beta2: f64,
     pub eps: f64,
+    pub weight_decay: f64,
 }
 
 impl Default for AdamConfig {
@@ -17,6 +18,7 @@ impl Default for AdamConfig {
             beta1: 0.9,
             beta2: 0.999,
             eps: 1e-8,
+            weight_decay: 0.0,
         }
     }
 }
@@ -62,7 +64,11 @@ impl Optimizer for Adam {
         let scale_v = 1f64 / (1f64 - c.beta2.powi(self.step_t as i32));
         for state in &mut self.states {
             if let Some(g) = grads.get(state.var.as_tensor()) {
-                let next_m = ((state.m.as_tensor() * c.beta1)? + (g * (1f64 - c.beta1))?)?;
+                let mut g = g.clone();
+                if c.weight_decay != 0.0 {
+                    g = (&g + (state.var.as_tensor() * c.weight_decay)?)?;
+                }
+                let next_m = ((state.m.as_tensor() * c.beta1)? + (&g * (1f64 - c.beta1))?)?;
                 let next_v = ((state.v.as_tensor() * c.beta2)? + (g.sqr()? * (1f64 - c.beta2))?)?;
                 let m_hat = &next_m * scale_m;
                 let v_hat = &next_v * scale_v;
