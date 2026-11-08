@@ -109,8 +109,16 @@ fn adaptive_max_pool_gradients_match_numerical() -> Result<()> {
 #[test]
 fn standalone_conv_transpose_gradients_match_numerical() -> Result<()> {
     let device = Device::Cpu;
-    let weight = Var::from_tensor(&Tensor::randn(0f32, 1f32, (1, 2, 2, 2), &device)?)?;
-    let x = Tensor::randn(0f32, 1f32, (2, 1, 2, 2), &device)?;
+    let weight = Var::from_tensor(&Tensor::from_vec(
+        vec![0.3f32, -0.2, 0.1, 0.4, -0.5, 0.25, -0.15, 0.05],
+        (1, 2, 2, 2),
+        &device,
+    )?)?;
+    let x = Tensor::from_vec(
+        vec![0.5f32, -0.25, 0.75, 0.1, -0.6, 0.2, 0.4, -0.3],
+        (2, 1, 2, 2),
+        &device,
+    )?;
     let reports = check(
         &[("weight".to_string(), weight.clone())],
         || {
@@ -129,7 +137,13 @@ fn standalone_conv_transpose_gradients_match_numerical() -> Result<()> {
 #[test]
 fn embedding_gradients_match_numerical() -> Result<()> {
     let device = Device::Cpu;
-    let weight = Var::from_tensor(&Tensor::randn(0f32, 1f32, (4, 3), &device)?)?;
+    let weight = Var::from_tensor(&Tensor::from_vec(
+        vec![
+            0.2f32, -0.4, 0.6, -0.1, 0.3, 0.5, -0.6, 0.15, -0.25, 0.35, 0.45, -0.35,
+        ],
+        (4, 3),
+        &device,
+    )?)?;
     let indices = Tensor::from_vec(vec![0u32, 2, 3, 2], 4, &device)?;
     let reports = check(
         &[("weight".to_string(), weight.clone())],
