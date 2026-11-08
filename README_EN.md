@@ -76,6 +76,24 @@ The conv2d arguments are input channels, output channels, kernel size, stride, a
 
 The save/load pair stores the architecture description together with the stride and padding, so a convolutional model is restored from the file in full and is ready for further training.
 
+## BatchNorm and dropout
+
+batch_norm goes after a linear or convolutional layer and normalizes activations across the batch; the input can be (N, C) or (N, C, H, W). dropout turns off a random fraction of neurons during training:
+
+```rust
+model.conv2d(1, 8, 5, 1, 2)?;
+model.batch_norm(8)?;
+model.relu();
+model.max_pool(2);
+model.dropout(0.25);
+```
+
+The batch_norm layer keeps running mean and variance: forward computes batch statistics and updates the running ones. For inference and test evaluation there is forward_eval — it works on the accumulated statistics, does not update them, and dropout simply switches off:
+
+```rust
+let acc = accuracy(&model.forward_eval(&test_x)?, &test_y)?;
+```
+
 ## CSV
 
 The loader reads numeric tables: every column except the label becomes an f32 feature, the label is u32. By default the delimiter is a comma, the first row is the header, and the label sits in the last column:
@@ -101,7 +119,7 @@ A CUDA Toolkit installation is required: candle compiles its kernels during the 
 
 | Module | What it does |
 |--------|--------------|
-| `model` | Linear, Conv2d, max_pool, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
+| `model` | Linear, Conv2d, batch_norm, max_pool, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
 | `optim` | Adam and SGD with momentum, plus AdamW from candle |
 | `loss` | cross entropy, MSE, Huber, binary cross entropy with logits |
 | `data` | xor and two spirals generators, a CSV loader, train/test split, mini batches |
@@ -143,7 +161,12 @@ model.save("model.safetensors")?;
 let restored = Model::load("model.safetensors", &device)?;
 ```
 
-The file stores the weights and the architecture description, including the convolution parameters, so load returns a model you can keep training.
+The file stores the weights and the architecture description, including the convolution parameters, so load returns a model you can keep training. save_half writes the weights in f16, the file comes out roughly half the size, and load upcasts the precision back to f32 on its own:
+
+```rust
+model.save_half("model.safetensors")?;
+let restored = Model::load("model.safetensors", &device)?;
+```
 
 ## Gradient checking
 
@@ -168,7 +191,7 @@ examples/bench.rs measures f32 matmul. On two Xeon cores it reaches 140-160 GFLO
 cargo test
 ```
 
-Fifteen tests: Adam and SGD steps are checked against hand computed values, the gradient check passes on linear and convolutional architectures plus pooling on its own, xor, spirals, and a convolutional network on images actually train, saved weights round trip without distortion, and the CSV loader parses quoted fields and reports broken rows. GitHub Actions runs fmt, clippy, and the tests on every push.
+Twenty-one tests: Adam and SGD steps are checked against hand computed values, the gradient check passes on linear and convolutional architectures, batch_norm, and pooling, xor, spirals, and a convolutional network with batch_norm actually train, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly, dropout zeroes out the expected fraction of neurons, and the CSV loader parses quoted fields and reports broken rows. GitHub Actions runs fmt, clippy, and the tests on every push.
 
 ## MNIST
 
@@ -181,7 +204,7 @@ The `mnist` feature adds a loader: on the first run it downloads four files (abo
 
 ## Roadmap
 
-A compact weight format, batchnorm, and dropout. If something here matters to you, open an issue.
+Learning rate schedulers, avg_pool. If something here matters to you, open an issue.
 
 ## License
 
