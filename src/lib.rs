@@ -27,6 +27,8 @@ pub mod prelude {
     pub use crate::metrics::{accuracy, argmax};
     pub use crate::model::{Act, Model, avg_pool, max_pool};
     pub use crate::optim::{Adam, AdamConfig, AdamW, Optimizer, ParamsAdamW, SGD, SgdConfig};
-    pub use crate::sched::{CosineAnnealingLR, ExponentialLR, LrScheduler, StepLR};
+    pub use crate::sched::{
+        CosineAnnealingLR, ExponentialLR, LrScheduler, OneCycleLR, StepLR, Warmup,
+    };
     pub use candle::{D, DType, Device, Result, Tensor, Var};
 }
