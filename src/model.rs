@@ -49,6 +49,8 @@ const CODE_LINEAR: u32 = 0;
 const CODE_CONV2D: u32 = 6;
 const CODE_MAX_POOL: u32 = 7;
 const CODE_FLATTEN: u32 = 8;
+const CODE_BATCH_NORM: u32 = 9;
+const CODE_DROPOUT: u32 = 10;
 
 pub fn max_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
     let (n, c, h, w) = xs.dims4()?;
@@ -65,11 +67,64 @@ pub fn max_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
 }
 
 #[derive(Debug)]
+struct BatchNorm {
+    running_mean: Var,
+    running_var: Var,
+    weight: Tensor,
+    bias: Tensor,
+    momentum: f64,
+    eps: f64,
+}
+
+impl BatchNorm {
+    fn forward_train(&self, xs: &Tensor) -> Result<Tensor> {
+        let mut inner = xs.dims().to_vec();
+        inner.swap(0, 1);
+        let x = xs.transpose(0, 1)?.flatten_from(1)?.contiguous()?;
+        let mean = x.mean_keepdim(1)?;
+        let centered = x.broadcast_sub(&mean)?;
+        let var = centered.sqr()?.mean_keepdim(1)?;
+        let n = x.dim(1)? as f64;
+        let correction = if n > 1.0 { n / (n - 1.0) } else { 1.0 };
+        let batch_mean = mean.flatten_all()?;
+        let batch_var = (var.flatten_all()? * correction)?;
+        let next_mean = ((self.running_mean.as_tensor() * (1.0 - self.momentum))?
+            + (&batch_mean * self.momentum)?)?;
+        let next_var = ((self.running_var.as_tensor() * (1.0 - self.momentum))?
+            + (&batch_var * self.momentum)?)?;
+        self.running_mean.set(&next_mean)?;
+        self.running_var.set(&next_var)?;
+        let out = centered.broadcast_div(&((var + self.eps)?.sqrt()?))?;
+        let out = out
+            .broadcast_mul(&self.weight.reshape(((), 1))?)?
+            .broadcast_add(&self.bias.reshape(((), 1))?)?;
+        out.reshape(inner.as_slice())?.transpose(0, 1)
+    }
+
+    fn forward_eval(&self, xs: &Tensor) -> Result<Tensor> {
+        let shape: Vec<usize> = xs
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(i, d)| if i == 1 { *d } else { 1 })
+            .collect();
+        let mean = self.running_mean.as_tensor().reshape(shape.as_slice())?;
+        let std = (self.running_var.as_tensor().reshape(shape.as_slice())? + self.eps)?.sqrt()?;
+        xs.broadcast_sub(&mean)?
+            .broadcast_div(&std)?
+            .broadcast_mul(&self.weight.reshape(shape.as_slice())?)?
+            .broadcast_add(&self.bias.reshape(shape.as_slice())?)
+    }
+}
+
+#[derive(Debug)]
 enum Layer {
     Linear(candle_nn::Linear),
     Conv2d(Conv2d),
+    BatchNorm(BatchNorm),
     MaxPool(usize),
     Flatten,
+    Dropout(f64),
     Activation(Act),
 }
 
@@ -96,8 +151,39 @@ impl Model {
     fn param_index(&self) -> usize {
         self.layers
             .iter()
-            .filter(|layer| matches!(layer, Layer::Linear(_) | Layer::Conv2d(_)))
+            .filter(|layer| {
+                matches!(
+                    layer,
+                    Layer::Linear(_) | Layer::Conv2d(_) | Layer::BatchNorm(_)
+                )
+            })
             .count()
+    }
+
+    fn var_handle(&self, name: &str) -> Result<Var> {
+        let data = self.varmap.data().lock().expect("varmap poisoned");
+        data.get(name)
+            .cloned()
+            .ok_or_else(|| candle::Error::Msg(format!("missing variable {name} in varmap")))
+    }
+
+    fn batch_norm_at(&self, index: usize, channels: usize, momentum: f64) -> Result<BatchNorm> {
+        if !(0.0..=1.0).contains(&momentum) {
+            candle::bail!("batch norm momentum must be in [0, 1], got {momentum}");
+        }
+        let vb = self.builder(index);
+        let _ = vb.get_with_hints(channels, "running_mean", candle_nn::Init::Const(0.0))?;
+        let _ = vb.get_with_hints(channels, "running_var", candle_nn::Init::Const(1.0))?;
+        let weight = vb.get_with_hints(channels, "weight", candle_nn::Init::Const(1.0))?;
+        let bias = vb.get_with_hints(channels, "bias", candle_nn::Init::Const(0.0))?;
+        Ok(BatchNorm {
+            running_mean: self.var_handle(&format!("layers.{index}.running_mean"))?,
+            running_var: self.var_handle(&format!("layers.{index}.running_var"))?,
+            weight,
+            bias,
+            momentum,
+            eps: 1e-5,
+        })
     }
 
     pub fn linear(&mut self, in_dim: usize, out_dim: usize) -> Result<()> {
@@ -136,6 +222,21 @@ impl Model {
         self.layers.push(Layer::MaxPool(kernel));
     }
 
+    pub fn batch_norm(&mut self, channels: usize) -> Result<()> {
+        let index = self.param_index();
+        let layer = self.batch_norm_at(index, channels, 0.1)?;
+        self.layers.push(Layer::BatchNorm(layer));
+        Ok(())
+    }
+
+    pub fn dropout(&mut self, p: f64) -> Result<()> {
+        if !(0.0..1.0).contains(&p) {
+            candle::bail!("dropout probability must be in [0, 1), got {p}");
+        }
+        self.layers.push(Layer::Dropout(p));
+        Ok(())
+    }
+
     pub fn flatten(&mut self) {
         self.layers.push(Layer::Flatten);
     }
@@ -160,18 +261,40 @@ impl Model {
         self.layers.push(Layer::Activation(Act::Softmax));
     }
 
-    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn pass(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
         let mut out = xs.clone();
         for layer in &self.layers {
             out = match layer {
                 Layer::Linear(l) => l.forward(&out)?,
                 Layer::Conv2d(l) => l.forward(&out)?,
+                Layer::BatchNorm(b) => {
+                    if train {
+                        b.forward_train(&out)?
+                    } else {
+                        b.forward_eval(&out)?
+                    }
+                }
                 Layer::MaxPool(k) => max_pool(&out, *k)?,
                 Layer::Flatten => out.flatten_from(1)?,
+                Layer::Dropout(p) => {
+                    if train {
+                        candle_nn::ops::dropout(&out, *p as f32)?
+                    } else {
+                        out
+                    }
+                }
                 Layer::Activation(a) => a.forward(&out)?,
             };
         }
         Ok(out)
+    }
+
+    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.pass(xs, true)
+    }
+
+    pub fn forward_eval(&self, xs: &Tensor) -> Result<Tensor> {
+        self.pass(xs, false)
     }
 
     pub fn vars(&self) -> Vec<Var> {
@@ -217,6 +340,14 @@ impl Model {
                 Layer::MaxPool(k) => {
                     arch.push(CODE_MAX_POOL);
                     args.push(*k as u32);
+                }
+                Layer::BatchNorm(b) => {
+                    arch.push(CODE_BATCH_NORM);
+                    args.push((b.momentum * 10000.0).round() as u32);
+                }
+                Layer::Dropout(p) => {
+                    arch.push(CODE_DROPOUT);
+                    args.push((p * 10000.0).round() as u32);
                 }
                 Layer::Flatten => arch.push(CODE_FLATTEN),
             }
@@ -369,6 +500,48 @@ impl Model {
                     let kernel = args[arg_index] as usize;
                     arg_index += 1;
                     model.layers.push(Layer::MaxPool(kernel));
+                }
+                CODE_BATCH_NORM => {
+                    if arg_index >= args.len() {
+                        candle::bail!("batch_norm layer has no momentum in meta.args");
+                    }
+                    let momentum = args[arg_index] as f64 / 10000.0;
+                    arg_index += 1;
+                    let index = param_index;
+                    param_index += 1;
+                    if index >= indices.len() {
+                        candle::bail!("architecture refers to missing layers.{index}");
+                    }
+                    if indices[index] != index {
+                        candle::bail!("missing layers.{index} in {}", path.as_ref().display());
+                    }
+                    let mean = tensors
+                        .get(&format!("layers.{index}.running_mean"))
+                        .ok_or_else(|| {
+                            candle::Error::Msg(format!("missing layers.{index}.running_mean"))
+                        })?;
+                    let channels = mean.dims1()?;
+                    let layer = model.batch_norm_at(index, channels, momentum)?;
+                    for key in [
+                        format!("layers.{index}.running_mean"),
+                        format!("layers.{index}.running_var"),
+                        format!("layers.{index}.weight"),
+                        format!("layers.{index}.bias"),
+                    ] {
+                        let tensor = tensors
+                            .get(&key)
+                            .ok_or_else(|| candle::Error::Msg(format!("missing {key}")))?;
+                        model.varmap.set_one(&key, tensor)?;
+                    }
+                    model.layers.push(Layer::BatchNorm(layer));
+                }
+                CODE_DROPOUT => {
+                    if arg_index >= args.len() {
+                        candle::bail!("dropout layer has no probability in meta.args");
+                    }
+                    let p = args[arg_index] as f64 / 10000.0;
+                    arg_index += 1;
+                    model.dropout(p)?;
                 }
                 CODE_FLATTEN => model.layers.push(Layer::Flatten),
                 other => {

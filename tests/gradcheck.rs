@@ -48,6 +48,29 @@ fn conv_gradients_match_numerical() -> Result<()> {
 }
 
 #[test]
+fn batch_norm_gradients_match_numerical() -> Result<()> {
+    let device = Device::Cpu;
+    let mut model = Model::new(&device);
+    model.linear(3, 6)?;
+    model.batch_norm(6)?;
+    model.tanh();
+    model.linear(6, 2)?;
+    let x = Tensor::randn(0f32, 1f32, (8, 3), &device)?;
+    let y = Tensor::from_vec(vec![0u32, 1, 0, 1, 1, 0, 0, 1], 8, &device)?;
+    let reports = check_model(
+        &model,
+        &x,
+        |logits| cross_entropy(logits, &y),
+        GradCheckConfig::default(),
+    )?;
+    assert!(!reports.is_empty());
+    for report in &reports {
+        assert!(report.ok, "{} max_err {:.2e}", report.name, report.max_err);
+    }
+    Ok(())
+}
+
+#[test]
 fn max_pool_gradients_match_numerical() -> Result<()> {
     let device = Device::Cpu;
     let values = vec![

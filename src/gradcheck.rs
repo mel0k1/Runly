@@ -96,10 +96,12 @@ pub fn check_model<L>(
 where
     L: Fn(&Tensor) -> Result<Tensor>,
 {
+    let first = loss(&model.forward(x)?)?.backward()?;
     let vars: Vec<(String, Var)> = {
         let data = model.varmap().data().lock().expect("varmap poisoned");
         let mut vars: Vec<(String, Var)> = data
             .iter()
+            .filter(|(_, var)| first.get(var.as_tensor()).is_some())
             .map(|(name, var)| (name.clone(), var.clone()))
             .collect();
         vars.sort_by(|a, b| a.0.cmp(&b.0));

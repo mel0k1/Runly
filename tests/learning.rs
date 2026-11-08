@@ -110,6 +110,38 @@ fn save_load_roundtrip_preserves_predictions() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn batch_norm_trains_and_eval_matches() -> Result<()> {
+    let device = Device::Cpu;
+    let data = xor(64, 0.15, 42);
+    let (x, y) = data.tensors(&device)?;
+    let mut model = Model::new(&device);
+    model.linear(2, 16)?;
+    model.batch_norm(16)?;
+    model.tanh();
+    model.linear(16, 2)?;
+    let mut opt = Adam::new_lr(model.vars(), 0.02)?;
+    for _ in 0..300 {
+        let logits = model.forward(&x)?;
+        let loss = cross_entropy(&logits, &y)?;
+        opt.backward_step(&loss)?;
+    }
+    let acc = accuracy(&model.forward(&x)?, &y)?;
+    assert!(acc >= 0.97, "train accuracy {acc}");
+    let eval_acc = accuracy(&model.forward_eval(&x)?, &y)?;
+    assert!(eval_acc >= 0.9, "eval accuracy {eval_acc}");
+    let path = std::env::temp_dir().join(format!("runly_bn_{}.safetensors", std::process::id()));
+    model.save(&path)?;
+    let loaded = Model::load(&path, &device)?;
+    let diff = (model.forward_eval(&x)? - loaded.forward_eval(&x)?)?
+        .abs()?
+        .sum_all()?
+        .to_scalar::<f32>()?;
+    assert!(diff < 1e-4, "eval predictions diff {diff}");
+    std::fs::remove_file(&path)?;
+    Ok(())
+}
+
 fn block_images() -> Result<(Tensor, Tensor)> {
     let device = Device::Cpu;
     let n = 60usize;
@@ -141,11 +173,12 @@ fn conv_model_learns_and_roundtrips() -> Result<()> {
     let (x, y) = block_images()?;
     let mut model = Model::new(&device);
     model.conv2d(1, 4, 3, 1, 0)?;
+    model.batch_norm(4)?;
     model.relu();
     model.max_pool(2);
     model.flatten();
     model.linear(4 * 3 * 3, 2)?;
-    assert_eq!(model.num_params(), 4 * 3 * 3 + 4 + 2 * 4 * 3 * 3 + 2);
+    assert_eq!(model.num_params(), 4 * 3 * 3 + 4 + 16 + 2 * 4 * 3 * 3 + 2);
     let mut opt = Adam::new_lr(model.vars(), 0.01)?;
     for _ in 0..200 {
         let logits = model.forward(&x)?;
