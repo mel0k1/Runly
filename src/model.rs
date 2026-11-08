@@ -1,4 +1,4 @@
-use candle::{D, DType, Device, Module, Result, Tensor, Var};
+use candle::{D, DType, Device, IndexOp, Module, Result, Tensor, Var};
 use candle_nn::{
     Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, VarBuilder, VarMap, linear,
 };
@@ -56,6 +56,8 @@ const CODE_DROPOUT: u32 = 10;
 const CODE_AVG_POOL: u32 = 11;
 const CODE_GLOBAL_AVG_POOL: u32 = 12;
 const CODE_CONV_TRANSPOSE2D: u32 = 13;
+const CODE_ADAPTIVE_AVG_POOL: u32 = 14;
+const CODE_ADAPTIVE_MAX_POOL: u32 = 15;
 
 pub fn avg_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
     let (n, c, h, w) = xs.dims4()?;
@@ -76,6 +78,48 @@ pub fn global_avg_pool(xs: &Tensor) -> Result<Tensor> {
         candle::bail!("global avg pool expects a (n, c, h, w) tensor");
     }
     xs.mean_keepdim((2, 3))
+}
+
+pub fn adaptive_avg_pool(xs: &Tensor, output: usize) -> Result<Tensor> {
+    if output == 0 {
+        candle::bail!("pool output size must be positive");
+    }
+    let (_, _, h, w) = xs.dims4()?;
+    let mut rows = Vec::new();
+    for i in 0..output {
+        let h0 = i * h / output;
+        let h1 = ((i + 1) * h).div_ceil(output);
+        let mut cols = Vec::new();
+        for j in 0..output {
+            let w0 = j * w / output;
+            let w1 = ((j + 1) * w).div_ceil(output);
+            let window = xs.i((.., .., h0..h1, w0..w1))?;
+            cols.push(window.mean((2, 3))?);
+        }
+        rows.push(Tensor::stack(&cols, 2)?);
+    }
+    Tensor::stack(&rows, 2)
+}
+
+pub fn adaptive_max_pool(xs: &Tensor, output: usize) -> Result<Tensor> {
+    if output == 0 {
+        candle::bail!("pool output size must be positive");
+    }
+    let (_, _, h, w) = xs.dims4()?;
+    let mut rows = Vec::new();
+    for i in 0..output {
+        let h0 = i * h / output;
+        let h1 = ((i + 1) * h).div_ceil(output);
+        let mut cols = Vec::new();
+        for j in 0..output {
+            let w0 = j * w / output;
+            let w1 = ((j + 1) * w).div_ceil(output);
+            let window = xs.i((.., .., h0..h1, w0..w1))?;
+            cols.push(window.max(3)?.max(2)?);
+        }
+        rows.push(Tensor::stack(&cols, 2)?);
+    }
+    Tensor::stack(&rows, 2)
 }
 
 pub fn max_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
@@ -151,6 +195,8 @@ enum Layer {
     BatchNorm(BatchNorm),
     MaxPool(usize),
     AvgPool(usize),
+    AdaptiveAvgPool(usize),
+    AdaptiveMaxPool(usize),
     GlobalAvgPool,
     Flatten,
     Dropout(f64),
@@ -287,6 +333,14 @@ impl Model {
         self.layers.push(Layer::GlobalAvgPool);
     }
 
+    pub fn adaptive_avg_pool(&mut self, output: usize) {
+        self.layers.push(Layer::AdaptiveAvgPool(output));
+    }
+
+    pub fn adaptive_max_pool(&mut self, output: usize) {
+        self.layers.push(Layer::AdaptiveMaxPool(output));
+    }
+
     pub fn batch_norm(&mut self, channels: usize) -> Result<()> {
         let index = self.param_index();
         let layer = self.batch_norm_at(index, channels, 0.1)?;
@@ -342,6 +396,8 @@ impl Model {
                 }
                 Layer::MaxPool(k) => max_pool(&out, *k)?,
                 Layer::AvgPool(k) => avg_pool(&out, *k)?,
+                Layer::AdaptiveAvgPool(k) => adaptive_avg_pool(&out, *k)?,
+                Layer::AdaptiveMaxPool(k) => adaptive_max_pool(&out, *k)?,
                 Layer::GlobalAvgPool => global_avg_pool(&out)?,
                 Layer::Flatten => out.flatten_from(1)?,
                 Layer::Dropout(p) => {
@@ -417,6 +473,14 @@ impl Model {
                 }
                 Layer::AvgPool(k) => {
                     arch.push(CODE_AVG_POOL);
+                    args.push(*k as u32);
+                }
+                Layer::AdaptiveAvgPool(k) => {
+                    arch.push(CODE_ADAPTIVE_AVG_POOL);
+                    args.push(*k as u32);
+                }
+                Layer::AdaptiveMaxPool(k) => {
+                    arch.push(CODE_ADAPTIVE_MAX_POOL);
                     args.push(*k as u32);
                 }
                 Layer::GlobalAvgPool => arch.push(CODE_GLOBAL_AVG_POOL),
@@ -643,6 +707,22 @@ impl Model {
                     let kernel = args[arg_index] as usize;
                     arg_index += 1;
                     model.layers.push(Layer::AvgPool(kernel));
+                }
+                CODE_ADAPTIVE_AVG_POOL => {
+                    if arg_index >= args.len() {
+                        candle::bail!("adaptive avg pool has no output size in meta.args");
+                    }
+                    let output = args[arg_index] as usize;
+                    arg_index += 1;
+                    model.layers.push(Layer::AdaptiveAvgPool(output));
+                }
+                CODE_ADAPTIVE_MAX_POOL => {
+                    if arg_index >= args.len() {
+                        candle::bail!("adaptive max pool has no output size in meta.args");
+                    }
+                    let output = args[arg_index] as usize;
+                    arg_index += 1;
+                    model.layers.push(Layer::AdaptiveMaxPool(output));
                 }
                 CODE_GLOBAL_AVG_POOL => model.layers.push(Layer::GlobalAvgPool),
                 CODE_BATCH_NORM => {

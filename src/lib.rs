@@ -26,8 +26,12 @@ pub mod prelude {
     pub use crate::device;
     pub use crate::gradcheck::{GradCheckConfig, GradReport, check, check_model};
     pub use crate::loss::{binary_cross_entropy_with_logit, cross_entropy, huber, mse};
-    pub use crate::metrics::{accuracy, argmax};
-    pub use crate::model::{Act, Model, avg_pool, global_avg_pool, max_pool};
+    pub use crate::metrics::{
+        ClassMetrics, accuracy, argmax, confusion_matrix, macro_f1, per_class_metrics,
+    };
+    pub use crate::model::{
+        Act, Model, adaptive_avg_pool, adaptive_max_pool, avg_pool, global_avg_pool, max_pool,
+    };
     pub use crate::optim::{Adam, AdamConfig, AdamW, Optimizer, ParamsAdamW, SGD, SgdConfig};
     pub use crate::sched::{
         CosineAnnealingLR, ExponentialLR, LrScheduler, OneCycleLR, StepLR, Warmup,

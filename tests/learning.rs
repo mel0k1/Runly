@@ -255,6 +255,87 @@ fn dataset_helpers_behave() {
 }
 
 #[test]
+fn adam_clip_grad_norm_matches_reference() -> Result<()> {
+    let device = Device::Cpu;
+    let w = Var::new(1.0f32, &device)?;
+    let mut opt = Adam::new_lr(vec![w.clone()], 0.05)?;
+    opt.set_max_grad_norm(Some(1.0));
+    let loss = (w.as_tensor() - 3f64)?.sqr()?;
+    let grads = loss.backward()?;
+    opt.step(&grads)?;
+    let got = w.as_tensor().to_scalar::<f32>()? as f64;
+    let expected = 1.0 + 0.05 * (1.0 / (1.0 + 1e-8));
+    assert!((got - expected).abs() < 1e-6, "{got} vs {expected}");
+    let norm = opt.last_grad_norm().expect("norm missing");
+    assert!((norm - 4.0).abs() < 1e-5, "norm {norm}");
+    Ok(())
+}
+
+#[test]
+fn adam_clip_is_skipped_when_norm_below_max() -> Result<()> {
+    let device = Device::Cpu;
+    let w = Var::new(1.0f32, &device)?;
+    let mut opt = Adam::new_lr(vec![w.clone()], 0.05)?;
+    opt.set_max_grad_norm(Some(100.0));
+    let loss = (w.as_tensor() - 3f64)?.sqr()?;
+    let grads = loss.backward()?;
+    opt.step(&grads)?;
+    let got = w.as_tensor().to_scalar::<f32>()? as f64;
+    let expected = 1.0 + 0.05 * (4.0 / (4.0 + 1e-8));
+    assert!((got - expected).abs() < 1e-6, "{got} vs {expected}");
+    let norm = opt.last_grad_norm().expect("norm missing");
+    assert!((norm - 4.0).abs() < 1e-5, "norm {norm}");
+    Ok(())
+}
+
+#[test]
+fn sgd_clip_grad_norm_matches_reference() -> Result<()> {
+    let device = Device::Cpu;
+    let w = Var::new(1.0f32, &device)?;
+    let mut opt = SGD::new_lr(vec![w.clone()], 0.1)?;
+    opt.set_max_grad_norm(Some(1.0));
+    for step in 0..2 {
+        let loss = (w.as_tensor() - 3f64)?.sqr()?;
+        let grads = loss.backward()?;
+        opt.step(&grads)?;
+        let expected = if step == 0 { 1.1 } else { 1.29 };
+        let got = w.as_tensor().to_scalar::<f32>()? as f64;
+        assert!(
+            (got - expected).abs() < 1e-5,
+            "step {step}: {got} vs {expected}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn clip_uses_global_norm_across_params() -> Result<()> {
+    let device = Device::Cpu;
+    let w1 = Var::new(1.0f32, &device)?;
+    let w2 = Var::new(1.0f32, &device)?;
+    let config = SgdConfig {
+        lr: 0.1,
+        momentum: 0.0,
+        max_grad_norm: Some(1.0),
+        ..Default::default()
+    };
+    let mut opt = SGD::new(vec![w1.clone(), w2.clone()], config)?;
+    let loss = ((w1.as_tensor() - 3f64)?.sqr()? + (w2.as_tensor() * 4f64)?.sqr()?)?;
+    let grads = loss.backward()?;
+    opt.step(&grads)?;
+    let norm = (16.0f64 + 1024.0).sqrt();
+    let expected1 = 1.0 + 0.1 * 4.0 / norm;
+    let expected2 = 1.0 - 0.1 * 32.0 / norm;
+    let got1 = w1.as_tensor().to_scalar::<f32>()? as f64;
+    let got2 = w2.as_tensor().to_scalar::<f32>()? as f64;
+    assert!((got1 - expected1).abs() < 1e-5, "{got1} vs {expected1}");
+    assert!((got2 - expected2).abs() < 1e-5, "{got2} vs {expected2}");
+    let reported = opt.last_grad_norm().expect("norm missing");
+    assert!((reported - norm).abs() < 1e-4, "norm {reported} vs {norm}");
+    Ok(())
+}
+
+#[test]
 fn adam_weight_decay_matches_reference() -> Result<()> {
     let device = Device::Cpu;
     let w = Var::new(1.0f32, &device)?;

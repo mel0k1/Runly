@@ -88,6 +88,21 @@ let mut sched = OneCycleLR::new(0.02, 300, 0.3, 0.001, 1e-4)?;
 
 examples/sched.rs trains xor with warmup plus cosine and with one cycle, printing the lr as it goes.
 
+## Gradient clipping
+
+Adam and SGD have max_grad_norm: before each step the optimizer computes the norm of all gradients and, when it exceeds the limit, shrinks them proportionally. Clipping is set in the config or switched on at runtime and pairs well with warmup, when the first steps are not yet settled:
+
+```rust
+let mut opt = Adam::new(model.vars(), AdamConfig {
+    lr: 0.02,
+    max_grad_norm: Some(1.0),
+    ..Default::default()
+})?;
+opt.set_max_grad_norm(Some(0.5));
+```
+
+last_grad_norm returns the gradient norm of the latest step when clipping is on — a handy value to watch for spikes in the training log.
+
 ## Convolutional networks
 
 conv2d adds a convolutional layer, max_pool and avg_pool shrink the feature maps, and flatten unfolds them into a vector before the linear layers:
@@ -115,7 +130,17 @@ model.conv_transpose2d(8, 4, 2, 2, 0)?;
 model.tanh();
 ```
 
-The convolution shrinks, the transposed one expands, together they form an encoder and a decoder. In save/load the layer is stored under its architecture code with its stride and padding, so the model is restored in full.
+The convolution shrinks, the transposed one expands, together they form an encoder and a decoder. In save/load the layer is stored under its architecture code with its stride and padding, so the model is restored in full. examples/autoencoder.rs trains such an autoencoder: a conv2d encoder squeezes an 8×8 image down to 4×2×2 and a conv_transpose2d decoder restores it, MSE drops from about 0.76 to 0.001 in 500 epochs.
+
+adaptive_avg_pool and adaptive_max_pool bring a feature map to a given output size regardless of the input: the window and the step are chosen automatically, and the input can be of any size, even smaller than the output. This is handy in front of a classifier for images of arbitrary sizes:
+
+```rust
+model.conv2d(3, 16, 3, 1, 1)?;
+model.relu();
+model.adaptive_avg_pool(4);
+model.flatten();
+model.linear(16 * 4 * 4, 10)?;
+```
 
 ## BatchNorm and dropout
 
@@ -160,14 +185,14 @@ A CUDA Toolkit installation is required: candle compiles its kernels during the 
 
 | Module | What it does |
 |--------|--------------|
-| `model` | Linear, Conv2d, ConvTranspose2d, batch_norm, max_pool, avg_pool, global_avg_pool, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
-| `optim` | Adam and SGD with momentum and weight decay, plus AdamW from candle |
+| `model` | Linear, Conv2d, ConvTranspose2d, batch_norm, max_pool, avg_pool, adaptive_avg_pool, adaptive_max_pool, global_avg_pool, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
+| `optim` | Adam and SGD with momentum, weight decay, and gradient clipping, plus AdamW from candle |
 | `sched` | learning rate schedulers: StepLR, ExponentialLR, CosineAnnealingLR, Warmup, OneCycleLR |
 | `checkpoint` | best model tracking and early stopping by metric |
 | `loss` | cross entropy, MSE, Huber, binary cross entropy with logits |
 | `data` | xor and two spirals generators, a CSV loader, train/test split, mini batches |
 | `gradcheck` | analytical gradients checked against numerical ones |
-| `metrics` | argmax and accuracy |
+| `metrics` | argmax, accuracy, confusion matrix, precision, recall, F1 |
 | `mnist` | MNIST loader behind the `mnist` feature |
 
 ## Tasks used to verify the library
@@ -245,6 +270,23 @@ let model = Model::load("best.safetensors", &device)?;
 
 best returns the best metric, bad_epochs counts the epochs without improvement in a row, and stopped tells whether the training was stopped.
 
+## Classification metrics
+
+confusion_matrix builds the confusion matrix: rows are the true classes, columns are the predicted ones. per_class_metrics breaks it down into precision, recall, F1, and support per class, and macro_f1 averages F1 across classes:
+
+```rust
+let matrix = confusion_matrix(&logits, &labels, 10)?;
+for (class, m) in per_class_metrics(&matrix).iter().enumerate() {
+    println!(
+        "class {class}: precision {:.3} recall {:.3} f1 {:.3}",
+        m.precision, m.recall, m.f1
+    );
+}
+println!("macro f1 {:.3}", macro_f1(&matrix));
+```
+
+A class with no predictions and no examples yields zero precision, recall, and F1 instead of a division by zero.
+
 ## Gradient checking
 
 Autograd is easy to get wrong, so the tests compare it against numerical differentiation: every parameter gradient is computed two ways, and the difference must stay within tolerances. You can run the same check on your own model:
@@ -268,7 +310,7 @@ examples/bench.rs measures f32 matmul. On two Xeon cores it reaches 140-160 GFLO
 cargo test
 ```
 
-Sixty-one tests: Adam and SGD steps with weight decay are checked against hand computed values, the schedulers produce exact schedules and really move the optimizer lr, the gradient check passes on linear and convolutional architectures, including the transposed convolution, batch_norm, and every kind of pooling, avg_pool, global_avg_pool, and the transposed convolution with a one by one kernel are checked against hand computed values, a network with a transposed convolution learns upsampling, xor, spirals, and a convolutional network with batch_norm actually train, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly, dropout zeroes out the expected fraction of neurons, the CSV loader parses quoted fields and reports broken rows, Checkpointer and EarlyStopping keep the best model, and early stopping fires on patience and min_delta. GitHub Actions runs fmt, clippy, and the tests on every push.
+Eighty tests: Adam and SGD steps with weight decay and gradient clipping are checked against hand computed values, clipping cuts by the global norm across all parameters, the schedulers produce exact schedules and really move the optimizer lr, the gradient check passes on linear and convolutional architectures, including the transposed convolution, batch_norm, and every kind of pooling, avg_pool, global_avg_pool, adaptive_avg_pool, and adaptive_max_pool are checked against hand computed values, including inputs that are not evenly divisible, a network with a transposed convolution learns upsampling, xor, spirals, and a convolutional network with batch_norm actually train, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly, dropout zeroes out the expected fraction of neurons, the CSV loader parses quoted fields and reports broken rows, Checkpointer and EarlyStopping keep the best model, early stopping fires on patience and min_delta, and the confusion matrix and per-class metrics match hand computed values. GitHub Actions runs fmt, clippy, and the tests on every push.
 
 ## MNIST
 
