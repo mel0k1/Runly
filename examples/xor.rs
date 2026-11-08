@@ -1,7 +1,7 @@
 use runly::prelude::*;
 
 fn main() -> Result<()> {
-    let device = Device::Cpu;
+    let device = device()?;
     let data = xor(64, 0.15, 42);
     let (x, y) = data.tensors(&device)?;
     let mut model = Model::new(&device);

@@ -1,7 +1,7 @@
 use runly::prelude::*;
 
 fn main() -> Result<()> {
-    let device = Device::Cpu;
+    let device = device()?;
     let data = spirals(200, 1.75, 0.2, 7);
     let (train, test) = data.train_test_split(0.2, 1);
     let (x, y) = train.tensors(&device)?;

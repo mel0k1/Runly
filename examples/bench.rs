@@ -1,9 +1,8 @@
 use runly::prelude::*;
 
-fn gflops(m: usize, k: usize, n: usize, iters: usize) -> Result<f64> {
-    let device = Device::Cpu;
-    let a = Tensor::randn(0f32, 1f32, (m, k), &device)?;
-    let b = Tensor::randn(0f32, 1f32, (k, n), &device)?;
+fn gflops(m: usize, k: usize, n: usize, iters: usize, device: &Device) -> Result<f64> {
+    let a = Tensor::randn(0f32, 1f32, (m, k), device)?;
+    let b = Tensor::randn(0f32, 1f32, (k, n), device)?;
     let _ = a.matmul(&b)?;
     let start = std::time::Instant::now();
     for _ in 0..iters {
@@ -15,7 +14,9 @@ fn gflops(m: usize, k: usize, n: usize, iters: usize) -> Result<f64> {
 }
 
 fn main() -> Result<()> {
-    println!("matmul f32, cpu");
+    let device = device()?;
+    let backend = if device.is_cuda() { "cuda" } else { "cpu" };
+    println!("matmul f32, {backend}");
     for (m, k, n) in [
         (256usize, 256usize, 256usize),
         (512, 512, 512),
@@ -25,7 +26,7 @@ fn main() -> Result<()> {
         let iters = if m <= 512 { 20 } else { 5 };
         println!(
             "{m:>5} x {k:<5} x {n:<5}  {:8.2} gflops",
-            gflops(m, k, n, iters)?
+            gflops(m, k, n, iters, &device)?
         );
     }
     Ok(())

@@ -3,7 +3,7 @@ use runly::prelude::*;
 
 #[cfg(feature = "mnist")]
 fn main() -> Result<()> {
-    let device = Device::Cpu;
+    let device = device()?;
     let mnist = runly::mnist::load(&device)?;
     let n = mnist.train_labels.elem_count();
     let mut model = Model::new(&device);

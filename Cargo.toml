@@ -2,7 +2,7 @@
 name = "runly"
 version = "0.1.0"
 edition = "2024"
-description = "Neural networks in Rust: MLP, autograd, Adam on top of the candle tensor engine"
+description = "Neural networks in Rust: MLP, convnets, autograd, Adam on top of the candle tensor engine"
 license = "Apache-2.0"
 repository = "https://github.com/mel0k1/Runly"
 keywords = ["machine-learning", "neural-network", "deep-learning", "autograd", "candle"]
@@ -18,3 +18,4 @@ ureq = { version = "2", optional = true }
 
 [features]
 mnist = ["dep:flate2", "dep:ureq"]
+cuda = ["candle/cuda", "candle-nn/cuda"]
