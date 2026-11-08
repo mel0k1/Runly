@@ -33,3 +33,69 @@ impl Checkpointer {
         &self.path
     }
 }
+
+pub struct EarlyStopping {
+    checkpointer: Checkpointer,
+    patience: usize,
+    min_delta: f64,
+    bad_epochs: usize,
+    stopped: bool,
+}
+
+impl EarlyStopping {
+    pub fn new<P: AsRef<Path>>(path: P, patience: usize, min_delta: f64) -> Result<Self> {
+        if patience == 0 {
+            candle::bail!("patience must be positive");
+        }
+        if min_delta < 0.0 {
+            candle::bail!("min_delta {min_delta} is negative");
+        }
+        Ok(Self {
+            checkpointer: Checkpointer::new(path),
+            patience,
+            min_delta,
+            bad_epochs: 0,
+            stopped: false,
+        })
+    }
+
+    pub fn update(&mut self, model: &Model, metric: f64) -> Result<bool> {
+        if self.stopped {
+            return Ok(true);
+        }
+        let improved = match self.checkpointer.best() {
+            None => true,
+            Some(best) => metric < best - self.min_delta,
+        };
+        if improved {
+            self.checkpointer.update(model, metric)?;
+            self.bad_epochs = 0;
+        } else {
+            self.bad_epochs += 1;
+            if self.bad_epochs >= self.patience {
+                self.stopped = true;
+            }
+        }
+        Ok(self.stopped)
+    }
+
+    pub fn best(&self) -> Option<f64> {
+        self.checkpointer.best()
+    }
+
+    pub fn bad_epochs(&self) -> usize {
+        self.bad_epochs
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stopped
+    }
+
+    pub fn checkpointer(&self) -> &Checkpointer {
+        &self.checkpointer
+    }
+
+    pub fn path(&self) -> &Path {
+        self.checkpointer.path()
+    }
+}

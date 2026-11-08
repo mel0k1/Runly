@@ -1,5 +1,7 @@
 use candle::{D, DType, Device, Module, Result, Tensor, Var};
-use candle_nn::{Conv2d, Conv2dConfig, VarBuilder, VarMap, linear};
+use candle_nn::{
+    Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig, VarBuilder, VarMap, linear,
+};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -53,6 +55,7 @@ const CODE_BATCH_NORM: u32 = 9;
 const CODE_DROPOUT: u32 = 10;
 const CODE_AVG_POOL: u32 = 11;
 const CODE_GLOBAL_AVG_POOL: u32 = 12;
+const CODE_CONV_TRANSPOSE2D: u32 = 13;
 
 pub fn avg_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
     let (n, c, h, w) = xs.dims4()?;
@@ -144,6 +147,7 @@ impl BatchNorm {
 enum Layer {
     Linear(candle_nn::Linear),
     Conv2d(Conv2d),
+    ConvTranspose2d(ConvTranspose2d),
     BatchNorm(BatchNorm),
     MaxPool(usize),
     AvgPool(usize),
@@ -179,7 +183,10 @@ impl Model {
             .filter(|layer| {
                 matches!(
                     layer,
-                    Layer::Linear(_) | Layer::Conv2d(_) | Layer::BatchNorm(_)
+                    Layer::Linear(_)
+                        | Layer::Conv2d(_)
+                        | Layer::ConvTranspose2d(_)
+                        | Layer::BatchNorm(_)
                 )
             })
             .count()
@@ -243,6 +250,31 @@ impl Model {
         Ok(())
     }
 
+    pub fn conv_transpose2d(
+        &mut self,
+        in_channels: usize,
+        out_channels: usize,
+        kernel: usize,
+        stride: usize,
+        padding: usize,
+    ) -> Result<()> {
+        let index = self.param_index();
+        let config = ConvTranspose2dConfig {
+            stride,
+            padding,
+            ..Default::default()
+        };
+        let layer = candle_nn::conv_transpose2d(
+            in_channels,
+            out_channels,
+            kernel,
+            config,
+            self.builder(index),
+        )?;
+        self.layers.push(Layer::ConvTranspose2d(layer));
+        Ok(())
+    }
+
     pub fn max_pool(&mut self, kernel: usize) {
         self.layers.push(Layer::MaxPool(kernel));
     }
@@ -300,6 +332,7 @@ impl Model {
             out = match layer {
                 Layer::Linear(l) => l.forward(&out)?,
                 Layer::Conv2d(l) => l.forward(&out)?,
+                Layer::ConvTranspose2d(l) => l.forward(&out)?,
                 Layer::BatchNorm(b) => {
                     if train {
                         b.forward_train(&out)?
@@ -368,6 +401,12 @@ impl Model {
                 Layer::Activation(a) => arch.push(a.code()),
                 Layer::Conv2d(c) => {
                     arch.push(CODE_CONV2D);
+                    let config = c.config();
+                    args.push(config.stride as u32);
+                    args.push(config.padding as u32);
+                }
+                Layer::ConvTranspose2d(c) => {
+                    arch.push(CODE_CONV_TRANSPOSE2D);
                     let config = c.config();
                     args.push(config.stride as u32);
                     args.push(config.padding as u32);
@@ -532,6 +571,62 @@ impl Model {
                         }
                     };
                     model.layers.push(Layer::Conv2d(layer));
+                }
+                CODE_CONV_TRANSPOSE2D => {
+                    if arg_index + 2 > args.len() {
+                        candle::bail!(
+                            "conv_transpose2d layer {} has no stride and padding in meta.args",
+                            param_index
+                        );
+                    }
+                    let stride = args[arg_index] as usize;
+                    let padding = args[arg_index + 1] as usize;
+                    arg_index += 2;
+                    let index = param_index;
+                    param_index += 1;
+                    if index >= indices.len() {
+                        candle::bail!("architecture refers to missing layers.{index}");
+                    }
+                    if indices[index] != index {
+                        candle::bail!("missing layers.{index} in {}", path.as_ref().display());
+                    }
+                    let weight =
+                        tensors
+                            .get(&format!("layers.{index}.weight"))
+                            .ok_or_else(|| {
+                                candle::Error::Msg(format!("missing layers.{index}.weight"))
+                            })?;
+                    let (in_c, out_c, k_h, k_w) = weight.dims4()?;
+                    if k_h != k_w {
+                        candle::bail!("rectangular kernel {k_h}x{k_w} is not supported");
+                    }
+                    let config = ConvTranspose2dConfig {
+                        stride,
+                        padding,
+                        ..Default::default()
+                    };
+                    let vb = VarBuilder::from_varmap(&model.varmap, DType::F32, device)
+                        .pp(format!("layers.{index}"));
+                    let bias_key = format!("layers.{index}.bias");
+                    let layer = match tensors.get(&bias_key) {
+                        Some(bias) => {
+                            let layer = candle_nn::conv_transpose2d(in_c, out_c, k_h, config, vb)?;
+                            model
+                                .varmap
+                                .set_one(format!("layers.{index}.weight"), weight)?;
+                            model.varmap.set_one(bias_key, bias)?;
+                            layer
+                        }
+                        None => {
+                            let layer =
+                                candle_nn::conv_transpose2d_no_bias(in_c, out_c, k_h, config, vb)?;
+                            model
+                                .varmap
+                                .set_one(format!("layers.{index}.weight"), weight)?;
+                            layer
+                        }
+                    };
+                    model.layers.push(Layer::ConvTranspose2d(layer));
                 }
                 CODE_MAX_POOL => {
                     if arg_index >= args.len() {

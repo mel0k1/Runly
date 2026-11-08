@@ -106,7 +106,16 @@ model.linear(16 * 7 * 7, 10)?;
 
 The conv2d arguments are input channels, output channels, kernel size, stride, and padding. The input has the shape (batch, channels, height, width), and the size must be divisible by the pooling kernel. max_pool takes the maximum in each window, avg_pool takes the average, and both work as standalone functions on a tensor when you need pooling without a model. global_avg_pool averages each feature map as a whole, turns any input into the shape (N, C, 1, 1), and does not require the size to be divisible; add flatten after it before a linear layer.
 
-The save/load pair stores the architecture description together with the stride and padding, so a convolutional model is restored from the file in full and is ready for further training.
+conv_transpose2d adds a transposed convolution, it grows the feature maps and shows up in decoders, autoencoders, and segmentation. The arguments are the same: input channels, output channels, kernel size, stride, and padding. The output size is (input − 1) · stride − 2 · padding + kernel, so a kernel of 2 with stride 2 and no padding doubles the map, and a kernel of 4 with stride 2 and padding 1 does the same:
+
+```rust
+model.conv2d(16, 8, 3, 1, 1)?;
+model.relu();
+model.conv_transpose2d(8, 4, 2, 2, 0)?;
+model.tanh();
+```
+
+The convolution shrinks, the transposed one expands, together they form an encoder and a decoder. In save/load the layer is stored under its architecture code with its stride and padding, so the model is restored in full.
 
 ## BatchNorm and dropout
 
@@ -151,10 +160,10 @@ A CUDA Toolkit installation is required: candle compiles its kernels during the 
 
 | Module | What it does |
 |--------|--------------|
-| `model` | Linear, Conv2d, batch_norm, max_pool, avg_pool, global_avg_pool, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
+| `model` | Linear, Conv2d, ConvTranspose2d, batch_norm, max_pool, avg_pool, global_avg_pool, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
 | `optim` | Adam and SGD with momentum and weight decay, plus AdamW from candle |
 | `sched` | learning rate schedulers: StepLR, ExponentialLR, CosineAnnealingLR, Warmup, OneCycleLR |
-| `checkpoint` | best model tracking by metric |
+| `checkpoint` | best model tracking and early stopping by metric |
 | `loss` | cross entropy, MSE, Huber, binary cross entropy with logits |
 | `data` | xor and two spirals generators, a CSV loader, train/test split, mini batches |
 | `gradcheck` | analytical gradients checked against numerical ones |
@@ -216,6 +225,26 @@ for epoch in 0..300 {
 let model = Model::load("best.safetensors", &device)?;
 ```
 
+EarlyStopping sits on top of Checkpointer: it watches the metric, writes the best model into the same file, and stops the training when there have been no improvements for a while. An improvement means the metric dropped by more than min_delta; once patience epochs pass without one, update returns true and the loop can break:
+
+```rust
+let mut stop = EarlyStopping::new("best.safetensors", 10, 1e-4)?;
+for epoch in 0..300 {
+    sched.apply(&mut opt);
+    let logits = model.forward(&x)?;
+    let loss = cross_entropy(&logits, &y)?;
+    opt.backward_step(&loss)?;
+    let val = mse(&model.forward_eval(&val_x)?, &val_y)?;
+    let val = val.to_dtype(DType::F64)?.to_scalar::<f64>()?;
+    if stop.update(&model, val)? {
+        break;
+    }
+}
+let model = Model::load("best.safetensors", &device)?;
+```
+
+best returns the best metric, bad_epochs counts the epochs without improvement in a row, and stopped tells whether the training was stopped.
+
 ## Gradient checking
 
 Autograd is easy to get wrong, so the tests compare it against numerical differentiation: every parameter gradient is computed two ways, and the difference must stay within tolerances. You can run the same check on your own model:
@@ -239,7 +268,7 @@ examples/bench.rs measures f32 matmul. On two Xeon cores it reaches 140-160 GFLO
 cargo test
 ```
 
-Fifty tests: Adam and SGD steps with weight decay are checked against hand computed values, the schedulers produce exact schedules and really move the optimizer lr, the gradient check passes on linear and convolutional architectures, batch_norm, and every kind of pooling, avg_pool and global_avg_pool are checked against hand computed values, xor, spirals, and a convolutional network with batch_norm actually train, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly, dropout zeroes out the expected fraction of neurons, the CSV loader parses quoted fields and reports broken rows, and the Checkpointer keeps the best model. GitHub Actions runs fmt, clippy, and the tests on every push.
+Sixty-one tests: Adam and SGD steps with weight decay are checked against hand computed values, the schedulers produce exact schedules and really move the optimizer lr, the gradient check passes on linear and convolutional architectures, including the transposed convolution, batch_norm, and every kind of pooling, avg_pool, global_avg_pool, and the transposed convolution with a one by one kernel are checked against hand computed values, a network with a transposed convolution learns upsampling, xor, spirals, and a convolutional network with batch_norm actually train, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly, dropout zeroes out the expected fraction of neurons, the CSV loader parses quoted fields and reports broken rows, Checkpointer and EarlyStopping keep the best model, and early stopping fires on patience and min_delta. GitHub Actions runs fmt, clippy, and the tests on every push.
 
 ## MNIST
 
