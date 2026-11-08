@@ -110,6 +110,64 @@ fn save_load_roundtrip_preserves_predictions() -> Result<()> {
     Ok(())
 }
 
+fn block_images() -> Result<(Tensor, Tensor)> {
+    let device = Device::Cpu;
+    let n = 60usize;
+    let mut x = Vec::with_capacity(n * 64);
+    let mut y = Vec::with_capacity(n);
+    for i in 0..n {
+        let class = (i % 2) as u32;
+        for r in 0..8usize {
+            for c in 0..8usize {
+                let block = if (r < 3 && c < 3 && class == 0) || (r >= 5 && c >= 5 && class == 1) {
+                    1.0f32
+                } else {
+                    0.0
+                };
+                let noise = ((i * 89 + r * 31 + c * 17) % 13) as f32 - 6.0;
+                x.push(block + noise / 30.0);
+            }
+        }
+        y.push(class);
+    }
+    let x = Tensor::from_vec(x, (n, 1, 8, 8), &device)?;
+    let y = Tensor::from_vec(y, n, &device)?;
+    Ok((x, y))
+}
+
+#[test]
+fn conv_model_learns_and_roundtrips() -> Result<()> {
+    let device = Device::Cpu;
+    let (x, y) = block_images()?;
+    let mut model = Model::new(&device);
+    model.conv2d(1, 4, 3, 1, 0)?;
+    model.relu();
+    model.max_pool(2);
+    model.flatten();
+    model.linear(4 * 3 * 3, 2)?;
+    assert_eq!(model.num_params(), 4 * 3 * 3 + 4 + 2 * 4 * 3 * 3 + 2);
+    let mut opt = Adam::new_lr(model.vars(), 0.01)?;
+    for _ in 0..200 {
+        let logits = model.forward(&x)?;
+        let loss = cross_entropy(&logits, &y)?;
+        opt.backward_step(&loss)?;
+    }
+    let acc = accuracy(&model.forward(&x)?, &y)?;
+    assert!(acc >= 0.95, "accuracy {acc}");
+    let path = std::env::temp_dir().join(format!("runly_conv_{}.safetensors", std::process::id()));
+    model.save(&path)?;
+    let loaded = Model::load(&path, &device)?;
+    let diff = (model.forward(&x)? - loaded.forward(&x)?)?
+        .abs()?
+        .sum_all()?
+        .to_scalar::<f32>()?;
+    assert!(diff < 1e-4, "predictions diff {diff}");
+    let acc = accuracy(&loaded.forward(&x)?, &y)?;
+    assert!(acc >= 0.95, "loaded accuracy {acc}");
+    std::fs::remove_file(&path)?;
+    Ok(())
+}
+
 #[test]
 fn dataset_helpers_behave() {
     let d = xor(8, 0.1, 1);

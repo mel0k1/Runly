@@ -1,5 +1,5 @@
 use candle::{D, DType, Device, Module, Result, Tensor, Var};
-use candle_nn::{VarBuilder, VarMap, linear};
+use candle_nn::{Conv2d, Conv2dConfig, VarBuilder, VarMap, linear};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -45,9 +45,31 @@ impl Act {
     }
 }
 
+const CODE_LINEAR: u32 = 0;
+const CODE_CONV2D: u32 = 6;
+const CODE_MAX_POOL: u32 = 7;
+const CODE_FLATTEN: u32 = 8;
+
+pub fn max_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
+    let (n, c, h, w) = xs.dims4()?;
+    if h % kernel != 0 || w % kernel != 0 {
+        candle::bail!("input {h}x{w} is not divisible by pool size {kernel}");
+    }
+    let oh = h / kernel;
+    let ow = w / kernel;
+    xs.reshape((n, c, oh, kernel, ow, kernel))?
+        .transpose(3, 4)?
+        .contiguous()?
+        .reshape((n, c, oh, ow, kernel * kernel))?
+        .max(D::Minus1)
+}
+
 #[derive(Debug)]
 enum Layer {
     Linear(candle_nn::Linear),
+    Conv2d(Conv2d),
+    MaxPool(usize),
+    Flatten,
     Activation(Act),
 }
 
@@ -71,15 +93,51 @@ impl Model {
             .pp(format!("layers.{index}"))
     }
 
-    pub fn linear(&mut self, in_dim: usize, out_dim: usize) -> Result<()> {
-        let index = self
-            .layers
+    fn param_index(&self) -> usize {
+        self.layers
             .iter()
-            .filter(|layer| matches!(layer, Layer::Linear(_)))
-            .count();
+            .filter(|layer| matches!(layer, Layer::Linear(_) | Layer::Conv2d(_)))
+            .count()
+    }
+
+    pub fn linear(&mut self, in_dim: usize, out_dim: usize) -> Result<()> {
+        let index = self.param_index();
         let layer = linear(in_dim, out_dim, self.builder(index))?;
         self.layers.push(Layer::Linear(layer));
         Ok(())
+    }
+
+    pub fn conv2d(
+        &mut self,
+        in_channels: usize,
+        out_channels: usize,
+        kernel: usize,
+        stride: usize,
+        padding: usize,
+    ) -> Result<()> {
+        let index = self.param_index();
+        let config = Conv2dConfig {
+            stride,
+            padding,
+            ..Default::default()
+        };
+        let layer = candle_nn::conv2d(
+            in_channels,
+            out_channels,
+            kernel,
+            config,
+            self.builder(index),
+        )?;
+        self.layers.push(Layer::Conv2d(layer));
+        Ok(())
+    }
+
+    pub fn max_pool(&mut self, kernel: usize) {
+        self.layers.push(Layer::MaxPool(kernel));
+    }
+
+    pub fn flatten(&mut self) {
+        self.layers.push(Layer::Flatten);
     }
 
     pub fn relu(&mut self) {
@@ -107,6 +165,9 @@ impl Model {
         for layer in &self.layers {
             out = match layer {
                 Layer::Linear(l) => l.forward(&out)?,
+                Layer::Conv2d(l) => l.forward(&out)?,
+                Layer::MaxPool(k) => max_pool(&out, *k)?,
+                Layer::Flatten => out.flatten_from(1)?,
                 Layer::Activation(a) => a.forward(&out)?,
             };
         }
@@ -137,18 +198,37 @@ impl Model {
                 map.insert(name.clone(), var.as_tensor().clone());
             }
         }
-        let arch: Vec<u32> = self
-            .layers
-            .iter()
-            .map(|layer| match layer {
-                Layer::Linear(_) => 0,
-                Layer::Activation(a) => a.code(),
-            })
-            .collect();
+        let mut arch: Vec<u32> = Vec::with_capacity(self.layers.len());
+        let mut args: Vec<u32> = Vec::new();
+        for layer in &self.layers {
+            match layer {
+                Layer::Linear(_) => arch.push(CODE_LINEAR),
+                Layer::Activation(a) => arch.push(a.code()),
+                Layer::Conv2d(c) => {
+                    arch.push(CODE_CONV2D);
+                    let config = c.config();
+                    args.push(config.stride as u32);
+                    args.push(config.padding as u32);
+                }
+                Layer::MaxPool(k) => {
+                    arch.push(CODE_MAX_POOL);
+                    args.push(*k as u32);
+                }
+                Layer::Flatten => arch.push(CODE_FLATTEN),
+            }
+        }
+        let n_layers = arch.len();
         map.insert(
             "meta.arch".to_string(),
-            Tensor::from_vec(arch, self.layers.len(), &self.device)?,
+            Tensor::from_vec(arch, n_layers, &self.device)?,
         );
+        if !args.is_empty() {
+            let n_args = args.len();
+            map.insert(
+                "meta.args".to_string(),
+                Tensor::from_vec(args, n_args, &self.device)?,
+            );
+        }
         candle::safetensors::save(&map, path)
     }
 
@@ -168,48 +248,133 @@ impl Model {
         indices.dedup();
         let arch: Vec<u32> = match tensors.get("meta.arch") {
             Some(t) => t.to_vec1::<u32>()?,
-            None => vec![0; indices.len()],
+            None => vec![CODE_LINEAR; indices.len()],
+        };
+        let args: Vec<u32> = match tensors.get("meta.args") {
+            Some(t) => t.to_vec1::<u32>()?,
+            None => vec![],
         };
         let mut model = Self::new(device);
-        let mut linear_index = 0usize;
+        let mut param_index = 0usize;
+        let mut arg_index = 0usize;
         for &code in &arch {
-            if code != 0 {
-                model.layers.push(Layer::Activation(Act::from_code(code)?));
-                continue;
-            }
-            let index = linear_index;
-            linear_index += 1;
-            if index >= indices.len() {
-                candle::bail!("architecture refers to missing layers.{index}");
-            }
-            if indices[index] != index {
-                candle::bail!("missing layers.{index} in {}", path.as_ref().display());
-            }
-            let weight = tensors
-                .get(&format!("layers.{index}.weight"))
-                .ok_or_else(|| candle::Error::Msg(format!("missing layers.{index}.weight")))?;
-            let bias = tensors.get(&format!("layers.{index}.bias")).cloned();
-            let (out_dim, in_dim) = weight.dims2()?;
-            let vb = VarBuilder::from_varmap(&model.varmap, DType::F32, device)
-                .pp(format!("layers.{index}"));
-            let w = vb.get((out_dim, in_dim), "weight")?;
-            model
-                .varmap
-                .set_one(format!("layers.{index}.weight"), weight)?;
-            let b = match &bias {
-                Some(bias) => {
-                    let tensor = vb.get(out_dim, "bias")?;
-                    model.varmap.set_one(format!("layers.{index}.bias"), bias)?;
-                    Some(tensor)
+            match code {
+                CODE_LINEAR => {
+                    let index = param_index;
+                    param_index += 1;
+                    if index >= indices.len() {
+                        candle::bail!("architecture refers to missing layers.{index}");
+                    }
+                    if indices[index] != index {
+                        candle::bail!("missing layers.{index} in {}", path.as_ref().display());
+                    }
+                    let weight =
+                        tensors
+                            .get(&format!("layers.{index}.weight"))
+                            .ok_or_else(|| {
+                                candle::Error::Msg(format!("missing layers.{index}.weight"))
+                            })?;
+                    let bias = tensors.get(&format!("layers.{index}.bias")).cloned();
+                    let (out_dim, in_dim) = weight.dims2()?;
+                    let vb = VarBuilder::from_varmap(&model.varmap, DType::F32, device)
+                        .pp(format!("layers.{index}"));
+                    let w = vb.get((out_dim, in_dim), "weight")?;
+                    model
+                        .varmap
+                        .set_one(format!("layers.{index}.weight"), weight)?;
+                    let b = match &bias {
+                        Some(bias) => {
+                            let tensor = vb.get(out_dim, "bias")?;
+                            model.varmap.set_one(format!("layers.{index}.bias"), bias)?;
+                            Some(tensor)
+                        }
+                        None => None,
+                    };
+                    model
+                        .layers
+                        .push(Layer::Linear(candle_nn::Linear::new(w, b)));
                 }
-                None => None,
-            };
-            model
-                .layers
-                .push(Layer::Linear(candle_nn::Linear::new(w, b)));
+                CODE_CONV2D => {
+                    if arg_index + 2 > args.len() {
+                        candle::bail!(
+                            "conv2d layer {} has no stride and padding in meta.args",
+                            param_index
+                        );
+                    }
+                    let stride = args[arg_index] as usize;
+                    let padding = args[arg_index + 1] as usize;
+                    arg_index += 2;
+                    let index = param_index;
+                    param_index += 1;
+                    if index >= indices.len() {
+                        candle::bail!("architecture refers to missing layers.{index}");
+                    }
+                    if indices[index] != index {
+                        candle::bail!("missing layers.{index} in {}", path.as_ref().display());
+                    }
+                    let weight =
+                        tensors
+                            .get(&format!("layers.{index}.weight"))
+                            .ok_or_else(|| {
+                                candle::Error::Msg(format!("missing layers.{index}.weight"))
+                            })?;
+                    let (out_c, in_c, k_h, k_w) = weight.dims4()?;
+                    if k_h != k_w {
+                        candle::bail!("rectangular kernel {k_h}x{k_w} is not supported");
+                    }
+                    let config = Conv2dConfig {
+                        stride,
+                        padding,
+                        ..Default::default()
+                    };
+                    let vb = VarBuilder::from_varmap(&model.varmap, DType::F32, device)
+                        .pp(format!("layers.{index}"));
+                    let bias_key = format!("layers.{index}.bias");
+                    let layer = match tensors.get(&bias_key) {
+                        Some(bias) => {
+                            let layer = candle_nn::conv2d(in_c, out_c, k_h, config, vb)?;
+                            model
+                                .varmap
+                                .set_one(format!("layers.{index}.weight"), weight)?;
+                            model.varmap.set_one(bias_key, bias)?;
+                            layer
+                        }
+                        None => {
+                            let layer = candle_nn::conv2d_no_bias(in_c, out_c, k_h, config, vb)?;
+                            model
+                                .varmap
+                                .set_one(format!("layers.{index}.weight"), weight)?;
+                            layer
+                        }
+                    };
+                    model.layers.push(Layer::Conv2d(layer));
+                }
+                CODE_MAX_POOL => {
+                    if arg_index >= args.len() {
+                        candle::bail!("max_pool layer has no kernel size in meta.args");
+                    }
+                    let kernel = args[arg_index] as usize;
+                    arg_index += 1;
+                    model.layers.push(Layer::MaxPool(kernel));
+                }
+                CODE_FLATTEN => model.layers.push(Layer::Flatten),
+                other => {
+                    if other <= 5 {
+                        model.layers.push(Layer::Activation(Act::from_code(other)?));
+                    } else {
+                        candle::bail!("unknown architecture code {other}");
+                    }
+                }
+            }
         }
-        if linear_index != indices.len() {
-            candle::bail!("unmatched linear layers in {}", path.as_ref().display());
+        if arg_index != args.len() {
+            candle::bail!("unmatched meta.args in {}", path.as_ref().display());
+        }
+        if param_index != indices.len() {
+            candle::bail!(
+                "unmatched parametrized layers in {}",
+                path.as_ref().display()
+            );
         }
         if model.layers.is_empty() {
             candle::bail!("no layers.* weights found in {}", path.as_ref().display());
