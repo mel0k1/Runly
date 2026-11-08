@@ -1,3 +1,4 @@
+pub mod checkpoint;
 pub mod data;
 pub mod gradcheck;
 pub mod loss;
@@ -18,6 +19,7 @@ pub fn device() -> candle::Result<Device> {
 }
 
 pub mod prelude {
+    pub use crate::checkpoint::Checkpointer;
     pub use crate::data::{
         CsvConfig, Dataset, batch_indices, load_csv, load_csv_named, load_csv_with, spirals, xor,
     };
