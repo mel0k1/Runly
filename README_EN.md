@@ -71,7 +71,22 @@ for epoch in 0..300 {
 }
 ```
 
-Inside are StepLR, ExponentialLR, and CosineAnnealingLR: the first cuts the lr by gamma every step_size steps, the second multiplies it by gamma on every step, and the third follows a cosine from the base value down to eta_min over t_max steps. The current value comes from lr(), and a scheduler works with any optimizer that implements the Optimizer trait. examples/sched.rs trains xor with a cosine schedule and prints the lr as it goes.
+Inside are StepLR, ExponentialLR, and CosineAnnealingLR: the first cuts the lr by gamma every step_size steps, the second multiplies it by gamma on every step, and the third follows a cosine from the base value down to eta_min over t_max steps. The current value comes from lr(), and a scheduler works with any optimizer that implements the Optimizer trait.
+
+Warmup wraps any scheduler: for the first warmup_steps steps the lr grows linearly up to peak, and then the inner schedule takes over:
+
+```rust
+let cosine = CosineAnnealingLR::new(0.02, 280, 1e-4)?;
+let mut sched = Warmup::new(cosine, 20, 0.02)?;
+```
+
+OneCycleLR raises the lr from initial_lr to the peak over the warmup fraction of total_steps and follows a cosine down to final_lr, one full cycle for a single training run:
+
+```rust
+let mut sched = OneCycleLR::new(0.02, 300, 0.3, 0.001, 1e-4)?;
+```
+
+examples/sched.rs trains xor with warmup plus cosine and with one cycle, printing the lr as it goes.
 
 ## Convolutional networks
 
@@ -89,7 +104,7 @@ model.flatten();
 model.linear(16 * 7 * 7, 10)?;
 ```
 
-The conv2d arguments are input channels, output channels, kernel size, stride, and padding. The input has the shape (batch, channels, height, width), and the size must be divisible by the pooling kernel. max_pool takes the maximum in each window, avg_pool takes the average, and both work as standalone functions on a tensor when you need pooling without a model.
+The conv2d arguments are input channels, output channels, kernel size, stride, and padding. The input has the shape (batch, channels, height, width), and the size must be divisible by the pooling kernel. max_pool takes the maximum in each window, avg_pool takes the average, and both work as standalone functions on a tensor when you need pooling without a model. global_avg_pool averages each feature map as a whole, turns any input into the shape (N, C, 1, 1), and does not require the size to be divisible; add flatten after it before a linear layer.
 
 The save/load pair stores the architecture description together with the stride and padding, so a convolutional model is restored from the file in full and is ready for further training.
 
@@ -136,9 +151,10 @@ A CUDA Toolkit installation is required: candle compiles its kernels during the 
 
 | Module | What it does |
 |--------|--------------|
-| `model` | Linear, Conv2d, batch_norm, max_pool, avg_pool, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
-| `optim` | Adam and SGD with momentum, plus AdamW from candle |
-| `sched` | learning rate schedulers: StepLR, ExponentialLR, CosineAnnealingLR |
+| `model` | Linear, Conv2d, batch_norm, max_pool, avg_pool, global_avg_pool, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
+| `optim` | Adam and SGD with momentum and weight decay, plus AdamW from candle |
+| `sched` | learning rate schedulers: StepLR, ExponentialLR, CosineAnnealingLR, Warmup, OneCycleLR |
+| `checkpoint` | best model tracking by metric |
 | `loss` | cross entropy, MSE, Huber, binary cross entropy with logits |
 | `data` | xor and two spirals generators, a CSV loader, train/test split, mini batches |
 | `gradcheck` | analytical gradients checked against numerical ones |
@@ -186,6 +202,20 @@ model.save_half("model.safetensors")?;
 let restored = Model::load("model.safetensors", &device)?;
 ```
 
+During training it is better to keep the best model rather than the latest one. Checkpointer compares the metric with the previous one and rewrites the file only when the metric improved; the best value is available through best:
+
+```rust
+let mut best = Checkpointer::new("best.safetensors");
+for epoch in 0..300 {
+    sched.apply(&mut opt);
+    let logits = model.forward(&x)?;
+    let loss = cross_entropy(&logits, &y)?;
+    opt.backward_step(&loss)?;
+    best.update(&model, loss.to_dtype(DType::F64)?.to_scalar::<f64>()?)?;
+}
+let model = Model::load("best.safetensors", &device)?;
+```
+
 ## Gradient checking
 
 Autograd is easy to get wrong, so the tests compare it against numerical differentiation: every parameter gradient is computed two ways, and the difference must stay within tolerances. You can run the same check on your own model:
@@ -209,7 +239,7 @@ examples/bench.rs measures f32 matmul. On two Xeon cores it reaches 140-160 GFLO
 cargo test
 ```
 
-Thirty-four tests: Adam and SGD steps are checked against hand computed values, the schedulers produce exact schedules and really move the optimizer lr, the gradient check passes on linear and convolutional architectures, batch_norm, and both kinds of pooling, avg_pool is checked against hand computed values, xor, spirals, and a convolutional network with batch_norm actually train, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly, dropout zeroes out the expected fraction of neurons, and the CSV loader parses quoted fields and reports broken rows. GitHub Actions runs fmt, clippy, and the tests on every push.
+Fifty tests: Adam and SGD steps with weight decay are checked against hand computed values, the schedulers produce exact schedules and really move the optimizer lr, the gradient check passes on linear and convolutional architectures, batch_norm, and every kind of pooling, avg_pool and global_avg_pool are checked against hand computed values, xor, spirals, and a convolutional network with batch_norm actually train, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly, dropout zeroes out the expected fraction of neurons, the CSV loader parses quoted fields and reports broken rows, and the Checkpointer keeps the best model. GitHub Actions runs fmt, clippy, and the tests on every push.
 
 ## MNIST
 

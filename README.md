@@ -71,7 +71,22 @@ for epoch in 0..300 {
 }
 ```
 
-Внутри StepLR, ExponentialLR и CosineAnnealingLR: первый режет lr в gamma раз каждые step_size шагов, второй умножает на gamma на каждом шаге, третий идёт по косинусу от базового значения до eta_min за t_max шагов. Текущее значение возвращает метод lr(), планировщик работает с любым оптимизатором, реализующим трейт Optimizer. examples/sched.rs обучает xor с косинусным расписанием и печатает lr по ходу обучения.
+Внутри StepLR, ExponentialLR и CosineAnnealingLR: первый режет lr в gamma раз каждые step_size шагов, второй умножает на gamma на каждом шаге, третий идёт по косинусу от базового значения до eta_min за t_max шагов. Текущее значение возвращает метод lr(), планировщик работает с любым оптимизатором, реализующим трейт Optimizer.
+
+Warmup оборачивает любой планировщик: первые warmup_steps шагов lr растёт линейно до peak, потом управление переходит к внутреннему расписанию:
+
+```rust
+let cosine = CosineAnnealingLR::new(0.02, 280, 1e-4)?;
+let mut sched = Warmup::new(cosine, 20, 0.02)?;
+```
+
+OneCycleLR поднимает lr от initial_lr до peak за warmup-долю от total_steps и по косинусу спускает до final_lr, весь цикл рассчитан на один прогон обучения:
+
+```rust
+let mut sched = OneCycleLR::new(0.02, 300, 0.3, 0.001, 1e-4)?;
+```
+
+examples/sched.rs обучает xor с warmup плюс косинусом и с one cycle, печатая lr по ходу.
 
 ## Свёрточные сети
 
@@ -89,7 +104,7 @@ model.flatten();
 model.linear(16 * 7 * 7, 10)?;
 ```
 
-Аргументы conv2d это входные каналы, выходные каналы, размер ядра, stride и padding. Вход задаётся формой (batch, каналы, высота, ширина), размер при пулинге должен делиться на ядро нацело. max_pool берёт в окне максимум, avg_pool среднее, оба работают и как отдельные функции над тензором, если нужен пулинг без модели.
+Аргументы conv2d это входные каналы, выходные каналы, размер ядра, stride и padding. Вход задаётся формой (batch, каналы, высота, ширина), размер при пулинге должен делиться на ядро нацело. max_pool берёт в окне максимум, avg_pool среднее, оба работают и как отдельные функции над тензором, если нужен пулинг без модели. global_avg_pool усредняет каждую карту целиком, приводит любой вход к форме (N, C, 1, 1) и не требует делить размер нацело, после него перед линейным слоем нужен flatten.
 
 В save/load вместе с весами попадает описание архитектуры вместе со stride и padding, поэтому свёрточная модель восстанавливается из файла целиком и готова к дообучению.
 
@@ -136,9 +151,10 @@ cargo run --release --features cuda --example cnn
 
 | Модуль | Что делает |
 |--------|------------|
-| `model` | Linear, Conv2d, batch_norm, max_pool, avg_pool, dropout, flatten и активации: relu, tanh, sigmoid, gelu, softmax |
-| `optim` | Adam и SGD с моментумом, плюс AdamW из candle |
-| `sched` | планировщики learning rate: StepLR, ExponentialLR, CosineAnnealingLR |
+| `model` | Linear, Conv2d, batch_norm, max_pool, avg_pool, global_avg_pool, dropout, flatten и активации: relu, tanh, sigmoid, gelu, softmax |
+| `optim` | Adam и SGD с моментумом и weight decay, плюс AdamW из candle |
+| `sched` | планировщики learning rate: StepLR, ExponentialLR, CosineAnnealingLR, Warmup, OneCycleLR |
+| `checkpoint` | трекинг лучшей модели по метрике |
 | `loss` | кросс-энтропия, MSE, Huber, бинарная кросс-энтропия с логитами |
 | `data` | генераторы xor и two spirals, CSV-загрузчик, train/test split, мини-батчи |
 | `gradcheck` | сверка аналитических градиентов с численными |
@@ -186,6 +202,20 @@ model.save_half("model.safetensors")?;
 let restored = Model::load("model.safetensors", &device)?;
 ```
 
+Во время обучения удобнее хранить не последнюю, а лучшую модель. Checkpointer сравнивает метрику с предыдущей и перезаписывает файл, только когда метрика улучшилась, лучший результат виден через best:
+
+```rust
+let mut best = Checkpointer::new("best.safetensors");
+for epoch in 0..300 {
+    sched.apply(&mut opt);
+    let logits = model.forward(&x)?;
+    let loss = cross_entropy(&logits, &y)?;
+    opt.backward_step(&loss)?;
+    best.update(&model, loss.to_dtype(DType::F64)?.to_scalar::<f64>()?)?;
+}
+let model = Model::load("best.safetensors", &device)?;
+```
+
 ## Проверка градиентов
 
 Автоград легко написать неправильно, поэтому в тестах он сверяется с численным дифференцированием: градиент каждого параметра считается двумя способами, расхождение не должно выходить за допуски. Свою модель можно проверить той же функцией:
@@ -209,7 +239,7 @@ examples/bench.rs меряет matmul в f32. На двух ядрах Xeon по
 cargo test
 ```
 
-Тридцать четыре теста: шаги Adam и SGD сверяются с ручным расчётом, планировщики выдают точные расписания и реально двигают lr, градиент-чек проходит на линейных и свёрточных архитектурах, batch_norm и обоих видах пулинга, avg_pool сверяется с ручным расчётом значений, xor, спирали и свёрточная сеть с batch_norm реально обучаются, веса сохраняются в f32 и f16 и восстанавливаются без искажений, batch_norm корректно переключается между обучением и инференсом, dropout зануляет ожидаемую долю нейронов, CSV-загрузчик разбирает кавычки и сообщает о битых строках. GitHub Actions на каждый push гоняет fmt, clippy и тесты.
+Пятьдесят тестов: шаги Adam и SGD с weight decay сверяются с ручным расчётом, планировщики выдают точные расписания и реально двигают lr, градиент-чек проходит на линейных и свёрточных архитектурах, batch_norm и всех видах пулинга, avg_pool и global_avg_pool сверяются с ручным расчётом значений, xor, спирали и свёрточная сеть с batch_norm реально обучаются, веса сохраняются в f32 и f16 и восстанавливаются без искажений, batch_norm корректно переключается между обучением и инференсом, dropout зануляет ожидаемую долю нейронов, CSV-загрузчик разбирает кавычки и сообщает о битых строках, Checkpointer держит лучшую модель. GitHub Actions на каждый push гоняет fmt, clippy и тесты.
 
 ## MNIST
 
