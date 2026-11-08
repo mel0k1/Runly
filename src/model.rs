@@ -51,6 +51,21 @@ const CODE_MAX_POOL: u32 = 7;
 const CODE_FLATTEN: u32 = 8;
 const CODE_BATCH_NORM: u32 = 9;
 const CODE_DROPOUT: u32 = 10;
+const CODE_AVG_POOL: u32 = 11;
+
+pub fn avg_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
+    let (n, c, h, w) = xs.dims4()?;
+    if h % kernel != 0 || w % kernel != 0 {
+        candle::bail!("input {h}x{w} is not divisible by pool size {kernel}");
+    }
+    let oh = h / kernel;
+    let ow = w / kernel;
+    xs.reshape((n, c, oh, kernel, ow, kernel))?
+        .transpose(3, 4)?
+        .contiguous()?
+        .reshape((n, c, oh, ow, kernel * kernel))?
+        .mean(D::Minus1)
+}
 
 pub fn max_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
     let (n, c, h, w) = xs.dims4()?;
@@ -123,6 +138,7 @@ enum Layer {
     Conv2d(Conv2d),
     BatchNorm(BatchNorm),
     MaxPool(usize),
+    AvgPool(usize),
     Flatten,
     Dropout(f64),
     Activation(Act),
@@ -222,6 +238,10 @@ impl Model {
         self.layers.push(Layer::MaxPool(kernel));
     }
 
+    pub fn avg_pool(&mut self, kernel: usize) {
+        self.layers.push(Layer::AvgPool(kernel));
+    }
+
     pub fn batch_norm(&mut self, channels: usize) -> Result<()> {
         let index = self.param_index();
         let layer = self.batch_norm_at(index, channels, 0.1)?;
@@ -275,6 +295,7 @@ impl Model {
                     }
                 }
                 Layer::MaxPool(k) => max_pool(&out, *k)?,
+                Layer::AvgPool(k) => avg_pool(&out, *k)?,
                 Layer::Flatten => out.flatten_from(1)?,
                 Layer::Dropout(p) => {
                     if train {
@@ -339,6 +360,10 @@ impl Model {
                 }
                 Layer::MaxPool(k) => {
                     arch.push(CODE_MAX_POOL);
+                    args.push(*k as u32);
+                }
+                Layer::AvgPool(k) => {
+                    arch.push(CODE_AVG_POOL);
                     args.push(*k as u32);
                 }
                 Layer::BatchNorm(b) => {
@@ -500,6 +525,14 @@ impl Model {
                     let kernel = args[arg_index] as usize;
                     arg_index += 1;
                     model.layers.push(Layer::MaxPool(kernel));
+                }
+                CODE_AVG_POOL => {
+                    if arg_index >= args.len() {
+                        candle::bail!("avg_pool layer has no kernel size in meta.args");
+                    }
+                    let kernel = args[arg_index] as usize;
+                    arg_index += 1;
+                    model.layers.push(Layer::AvgPool(kernel));
                 }
                 CODE_BATCH_NORM => {
                     if arg_index >= args.len() {

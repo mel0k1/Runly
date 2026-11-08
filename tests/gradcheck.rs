@@ -109,3 +109,21 @@ fn mse_gradients_match_numerical() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn avg_pool_gradients_match_numerical() -> Result<()> {
+    let device = Device::Cpu;
+    let values = vec![
+        -2.0f32, 1.0, 0.5, 3.0, -1.0, 4.0, 2.0, 0.0, 5.0, -3.0, 1.5, 2.5, 0.25, 1.25, 3.5, -0.5,
+    ];
+    let x = Var::from_tensor(&Tensor::from_vec(values, (1, 1, 4, 4), &device)?)?;
+    let reports = check(
+        &[("x".to_string(), x.clone())],
+        || avg_pool(x.as_tensor(), 2)?.sqr()?.sum_all(),
+        GradCheckConfig::default(),
+    )?;
+    for report in &reports {
+        assert!(report.ok, "{} max_err {:.2e}", report.name, report.max_err);
+    }
+    Ok(())
+}
