@@ -138,6 +138,28 @@ fn batch_norm_trains_and_eval_matches() -> Result<()> {
         .sum_all()?
         .to_scalar::<f32>()?;
     assert!(diff < 1e-4, "eval predictions diff {diff}");
+    let tensors = runly::candle::safetensors::load(&path, &device)?;
+    let saved_mean = tensors.get("layers.1.running_mean").unwrap();
+    let drift = saved_mean.abs()?.sum_all()?.to_scalar::<f32>()?;
+    assert!(
+        drift > 1e-3,
+        "saved running_mean is still the init value, |sum| {drift}"
+    );
+    let live_mean = {
+        let data = model.varmap().data().lock().expect("varmap poisoned");
+        data.get("layers.1.running_mean")
+            .unwrap()
+            .as_tensor()
+            .clone()
+    };
+    let delta = (&live_mean - saved_mean)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+    assert!(
+        delta < 1e-6,
+        "saved running_mean differs from the model, delta {delta}"
+    );
     std::fs::remove_file(&path)?;
     Ok(())
 }

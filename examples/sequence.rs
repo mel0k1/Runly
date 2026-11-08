@@ -43,17 +43,16 @@ fn main() -> Result<()> {
 
     let emb = Var::from_tensor(&Tensor::randn(0f32, 0.1f32, (vocab, 8), &device)?)?;
     let mut model = Model::new(&device);
-    model.flatten();
-    model.linear(len * 8, 32)?;
-    model.tanh();
-    model.linear(32, 2)?;
+    model.gru(8, 24)?;
+    model.select_last_step();
+    model.linear(24, 2)?;
 
     let mut vars = vec![emb.clone()];
     vars.extend(model.vars());
     let mut opt = Adam::new(
         vars,
         AdamConfig {
-            lr: 0.002,
+            lr: 0.005,
             max_grad_norm: Some(1.0),
             ..Default::default()
         },
@@ -69,7 +68,7 @@ fn main() -> Result<()> {
         &train_x,
         &train_y,
         FitConfig {
-            epochs: 300,
+            epochs: 200,
             batch_size: 64,
             shuffle: true,
             seed: 42,

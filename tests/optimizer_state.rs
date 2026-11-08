@@ -141,6 +141,40 @@ fn optimizer_state_rejects_mismatched_size() -> Result<()> {
 }
 
 #[test]
+fn restore_state_roundtrips_in_memory() -> Result<()> {
+    let device = Device::Cpu;
+    let data = xor(16, 0.1, 5);
+    let (x, y) = data.tensors(&device)?;
+    let mut model = Model::new(&device);
+    model.linear(2, 8)?;
+    model.tanh();
+    model.linear(8, 2)?;
+    let mut opt = Adam::new_lr(model.vars(), 0.03)?;
+    for _ in 0..5 {
+        let loss = cross_entropy(&model.forward(&x)?, &y)?;
+        opt.backward_step(&loss)?;
+    }
+    let snapshot = opt.state_tensors()?;
+    let mut sgd = SGD::new_lr(model.vars(), 0.01)?;
+    for _ in 0..3 {
+        let loss = cross_entropy(&model.forward(&x)?, &y)?;
+        sgd.backward_step(&loss)?;
+    }
+    opt.restore_state(&snapshot)?;
+    let restored = opt.state_tensors()?;
+    for (name, tensor) in &snapshot {
+        let value = restored.get(name).unwrap();
+        let delta = (value - tensor)?
+            .abs()?
+            .max_all()?
+            .to_dtype(DType::F64)?
+            .to_scalar::<f64>()?;
+        assert!(delta < 1e-9, "{name} changed by {delta}");
+    }
+    Ok(())
+}
+
+#[test]
 fn checkpointer_saves_model_and_optimizer() -> Result<()> {
     let device = Device::Cpu;
     let data = xor(8, 0.1, 3);

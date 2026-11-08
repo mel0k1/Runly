@@ -58,6 +58,9 @@ const CODE_GLOBAL_AVG_POOL: u32 = 12;
 const CODE_CONV_TRANSPOSE2D: u32 = 13;
 const CODE_ADAPTIVE_AVG_POOL: u32 = 14;
 const CODE_ADAPTIVE_MAX_POOL: u32 = 15;
+const CODE_RNN: u32 = 16;
+const CODE_GRU: u32 = 17;
+const CODE_SELECT_LAST: u32 = 18;
 
 pub fn avg_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
     let (n, c, h, w) = xs.dims4()?;
@@ -164,6 +167,11 @@ pub fn conv_transpose2d(
     }
 }
 
+pub fn select_last_step(xs: &Tensor) -> Result<Tensor> {
+    let (_, steps, _) = xs.dims3()?;
+    xs.narrow(1, steps - 1, 1)?.squeeze(1)?.contiguous()
+}
+
 pub fn embedding(weight: &Tensor, indices: &Tensor) -> Result<Tensor> {
     if weight.dims().len() != 2 {
         candle::bail!("embedding weight must be a (vocab, dim) matrix");
@@ -227,17 +235,73 @@ impl BatchNorm {
 }
 
 #[derive(Debug)]
+struct Rnn {
+    ih: candle_nn::Linear,
+    hh: candle_nn::Linear,
+}
+
+impl Rnn {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let (batch, steps, _) = xs.dims3()?;
+        let (hidden, _) = self.ih.weight().dims2()?;
+        let mut state = Tensor::zeros((batch, hidden), DType::F32, xs.device())?;
+        let mut states = Vec::with_capacity(steps);
+        for step in 0..steps {
+            let x = xs.narrow(1, step, 1)?.squeeze(1)?.contiguous()?;
+            state = (self.ih.forward(&x)? + self.hh.forward(&state)?)?.tanh()?;
+            states.push(state.clone());
+        }
+        Tensor::stack(&states, 1)
+    }
+}
+
+#[derive(Debug)]
+struct Gru {
+    ir: candle_nn::Linear,
+    hr: candle_nn::Linear,
+    iz: candle_nn::Linear,
+    hz: candle_nn::Linear,
+    ni: candle_nn::Linear,
+    nh: candle_nn::Linear,
+}
+
+impl Gru {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let (batch, steps, _) = xs.dims3()?;
+        let (hidden, _) = self.ir.weight().dims2()?;
+        let mut state = Tensor::zeros((batch, hidden), DType::F32, xs.device())?;
+        let mut states = Vec::with_capacity(steps);
+        for step in 0..steps {
+            let x = xs.narrow(1, step, 1)?.squeeze(1)?.contiguous()?;
+            let r = candle_nn::ops::sigmoid(&(&self.ir.forward(&x)? + self.hr.forward(&state)?)?)?;
+            let z = candle_nn::ops::sigmoid(&(&self.iz.forward(&x)? + self.hz.forward(&state)?)?)?;
+            let n =
+                (&self.ni.forward(&x)? + r.broadcast_mul(&self.nh.forward(&state)?)?)?.tanh()?;
+            state = z
+                .affine(-1f64, 1f64)?
+                .broadcast_mul(&n)?
+                .broadcast_add(&z.broadcast_mul(&state)?)?;
+            states.push(state.clone());
+        }
+        Tensor::stack(&states, 1)
+    }
+}
+
+#[derive(Debug)]
 enum Layer {
     Linear(candle_nn::Linear),
     Conv2d(Conv2d),
     ConvTranspose2d(ConvTranspose2d),
     BatchNorm(BatchNorm),
+    Rnn(Rnn),
+    Gru(Gru),
     MaxPool(usize),
     AvgPool(usize),
     AdaptiveAvgPool(usize),
     AdaptiveMaxPool(usize),
     GlobalAvgPool,
     Flatten,
+    SelectLast,
     Dropout(f64),
     Activation(Act),
 }
@@ -272,6 +336,8 @@ impl Model {
                         | Layer::Conv2d(_)
                         | Layer::ConvTranspose2d(_)
                         | Layer::BatchNorm(_)
+                        | Layer::Rnn(_)
+                        | Layer::Gru(_)
                 )
             })
             .count()
@@ -380,6 +446,50 @@ impl Model {
         self.layers.push(Layer::AdaptiveMaxPool(output));
     }
 
+    pub fn rnn(&mut self, input_size: usize, hidden_size: usize) -> Result<()> {
+        if input_size == 0 || hidden_size == 0 {
+            candle::bail!(
+                "rnn sizes must be positive, got input {input_size}, hidden {hidden_size}"
+            );
+        }
+        let index = self.param_index();
+        let layer = {
+            let vb = self.builder(index);
+            Rnn {
+                ih: linear(input_size, hidden_size, vb.pp("ih"))?,
+                hh: linear(hidden_size, hidden_size, vb.pp("hh"))?,
+            }
+        };
+        self.layers.push(Layer::Rnn(layer));
+        Ok(())
+    }
+
+    pub fn gru(&mut self, input_size: usize, hidden_size: usize) -> Result<()> {
+        if input_size == 0 || hidden_size == 0 {
+            candle::bail!(
+                "gru sizes must be positive, got input {input_size}, hidden {hidden_size}"
+            );
+        }
+        let index = self.param_index();
+        let layer = {
+            let vb = self.builder(index);
+            Gru {
+                ir: linear(input_size, hidden_size, vb.pp("ir"))?,
+                hr: linear(hidden_size, hidden_size, vb.pp("hr"))?,
+                iz: linear(input_size, hidden_size, vb.pp("iz"))?,
+                hz: linear(hidden_size, hidden_size, vb.pp("hz"))?,
+                ni: linear(input_size, hidden_size, vb.pp("ni"))?,
+                nh: linear(hidden_size, hidden_size, vb.pp("nh"))?,
+            }
+        };
+        self.layers.push(Layer::Gru(layer));
+        Ok(())
+    }
+
+    pub fn select_last_step(&mut self) {
+        self.layers.push(Layer::SelectLast);
+    }
+
     pub fn batch_norm(&mut self, channels: usize) -> Result<()> {
         let index = self.param_index();
         let layer = self.batch_norm_at(index, channels, 0.1)?;
@@ -433,12 +543,15 @@ impl Model {
                         b.forward_eval(&out)?
                     }
                 }
+                Layer::Rnn(l) => l.forward(&out)?,
+                Layer::Gru(l) => l.forward(&out)?,
                 Layer::MaxPool(k) => max_pool(&out, *k)?,
                 Layer::AvgPool(k) => avg_pool(&out, *k)?,
                 Layer::AdaptiveAvgPool(k) => adaptive_avg_pool(&out, *k)?,
                 Layer::AdaptiveMaxPool(k) => adaptive_max_pool(&out, *k)?,
                 Layer::GlobalAvgPool => global_avg_pool(&out)?,
                 Layer::Flatten => out.flatten_from(1)?,
+                Layer::SelectLast => select_last_step(&out)?,
                 Layer::Dropout(p) => {
                     if train {
                         candle_nn::ops::dropout(&out, *p as f32)?
@@ -527,6 +640,9 @@ impl Model {
                     args.push(*k as u32);
                 }
                 Layer::GlobalAvgPool => arch.push(CODE_GLOBAL_AVG_POOL),
+                Layer::Rnn(_) => arch.push(CODE_RNN),
+                Layer::Gru(_) => arch.push(CODE_GRU),
+                Layer::SelectLast => arch.push(CODE_SELECT_LAST),
                 Layer::BatchNorm(b) => {
                     arch.push(CODE_BATCH_NORM);
                     args.push((b.momentum * 10000.0).round() as u32);
@@ -743,6 +859,83 @@ impl Model {
                     arg_index += 1;
                     model.layers.push(Layer::MaxPool(kernel));
                 }
+                CODE_RNN => {
+                    let index = param_index;
+                    param_index += 1;
+                    if index >= indices.len() {
+                        candle::bail!("architecture refers to missing layers.{index}");
+                    }
+                    if indices[index] != index {
+                        candle::bail!("missing layers.{index} in {}", path.as_ref().display());
+                    }
+                    let weight = tensors
+                        .get(&format!("layers.{index}.ih.weight"))
+                        .ok_or_else(|| {
+                            candle::Error::Msg(format!("missing layers.{index}.ih.weight"))
+                        })?;
+                    let (hidden, input) = weight.dims2()?;
+                    let vb = VarBuilder::from_varmap(&model.varmap, DType::F32, device)
+                        .pp(format!("layers.{index}"));
+                    let layer = Rnn {
+                        ih: linear(input, hidden, vb.pp("ih"))?,
+                        hh: linear(hidden, hidden, vb.pp("hh"))?,
+                    };
+                    for name in ["ih.weight", "ih.bias", "hh.weight", "hh.bias"] {
+                        let key = format!("layers.{index}.{name}");
+                        let tensor = tensors
+                            .get(&key)
+                            .ok_or_else(|| candle::Error::Msg(format!("missing {key}")))?;
+                        model.varmap.set_one(&key, tensor)?;
+                    }
+                    model.layers.push(Layer::Rnn(layer));
+                }
+                CODE_GRU => {
+                    let index = param_index;
+                    param_index += 1;
+                    if index >= indices.len() {
+                        candle::bail!("architecture refers to missing layers.{index}");
+                    }
+                    if indices[index] != index {
+                        candle::bail!("missing layers.{index} in {}", path.as_ref().display());
+                    }
+                    let weight = tensors
+                        .get(&format!("layers.{index}.ir.weight"))
+                        .ok_or_else(|| {
+                            candle::Error::Msg(format!("missing layers.{index}.ir.weight"))
+                        })?;
+                    let (hidden, input) = weight.dims2()?;
+                    let vb = VarBuilder::from_varmap(&model.varmap, DType::F32, device)
+                        .pp(format!("layers.{index}"));
+                    let layer = Gru {
+                        ir: linear(input, hidden, vb.pp("ir"))?,
+                        hr: linear(hidden, hidden, vb.pp("hr"))?,
+                        iz: linear(input, hidden, vb.pp("iz"))?,
+                        hz: linear(hidden, hidden, vb.pp("hz"))?,
+                        ni: linear(input, hidden, vb.pp("ni"))?,
+                        nh: linear(hidden, hidden, vb.pp("nh"))?,
+                    };
+                    for name in [
+                        "ir.weight",
+                        "ir.bias",
+                        "hr.weight",
+                        "hr.bias",
+                        "iz.weight",
+                        "iz.bias",
+                        "hz.weight",
+                        "hz.bias",
+                        "ni.weight",
+                        "ni.bias",
+                        "nh.weight",
+                        "nh.bias",
+                    ] {
+                        let key = format!("layers.{index}.{name}");
+                        let tensor = tensors
+                            .get(&key)
+                            .ok_or_else(|| candle::Error::Msg(format!("missing {key}")))?;
+                        model.varmap.set_one(&key, tensor)?;
+                    }
+                    model.layers.push(Layer::Gru(layer));
+                }
                 CODE_AVG_POOL => {
                     if arg_index >= args.len() {
                         candle::bail!("avg_pool layer has no kernel size in meta.args");
@@ -811,6 +1004,7 @@ impl Model {
                     model.dropout(p)?;
                 }
                 CODE_FLATTEN => model.layers.push(Layer::Flatten),
+                CODE_SELECT_LAST => model.layers.push(Layer::SelectLast),
                 other => {
                     if other <= 5 {
                         model.layers.push(Layer::Activation(Act::from_code(other)?));

@@ -101,7 +101,21 @@ let mut opt = Adam::new(model.vars(), AdamConfig {
 opt.set_max_grad_norm(Some(0.5));
 ```
 
-last_grad_norm returns the gradient norm of the latest step when clipping is on — a handy value to watch for spikes in the training log.
+last_grad_norm returns the gradient norm of the latest step. The norm is computed on every step whether or not clipping is on — a handy value to watch for spikes in the training log.
+
+## Finding the learning rate
+
+LrFinder runs an LR range test: it starts at min_lr and raises the learning rate geometrically up to max_lr, recording the loss and the gradient norm at every step. Weights and optimizer state are snapshotted before the run and restored after it, so the model is left exactly as it was:
+
+```rust
+let finder = LrFinder::new(1e-5, 10.0, 100)?;
+let points = finder.run(&model, &mut opt, &x, &y, |xb, yb| {
+    cross_entropy(&model.forward(xb)?, yb)
+}, 64)?;
+println!("suggested lr {:?}", suggested_lr(&points));
+```
+
+points holds the lr, loss, and gradient norm of every step; on a log-lr plot the best learning rate sits where the loss falls fastest, and suggested_lr returns the start of the steepest descent stretch. The run stops as soon as the loss grows stop_div times above its best value (4 by default) or becomes NaN. The optimizer must implement the GradNorm trait — Adam and SGD do.
 
 ## Mini batches
 
@@ -183,6 +197,8 @@ The batch_norm layer keeps running mean and variance: forward computes batch sta
 let acc = accuracy(&model.forward_eval(&test_x)?, &test_y)?;
 ```
 
+The running statistics live in the varmap next to the weights, so model.save writes them into safetensors along with the parameters and Model::load brings them back: inference after loading matches inference before saving, and resumed training continues from the accumulated statistics.
+
 ## CSV
 
 The loader reads numeric tables: every column except the label becomes an f32 feature, the label is u32. By default the delimiter is a comma, the first row is the header, and the label sits in the last column:
@@ -208,9 +224,10 @@ A CUDA Toolkit installation is required: candle compiles its kernels during the 
 
 | Module | What it does |
 |--------|--------------|
-| `model` | Linear, Conv2d, ConvTranspose2d, embedding, batch_norm, max_pool, avg_pool, adaptive_avg_pool, adaptive_max_pool, global_avg_pool, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
-| `optim` | Adam and SGD with momentum, weight decay, and gradient clipping, plus AdamW from candle |
+| `model` | Linear, Conv2d, ConvTranspose2d, RNN, GRU, embedding, batch_norm, max_pool, avg_pool, adaptive_avg_pool, adaptive_max_pool, global_avg_pool, select_last_step, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
+| `optim` | Adam and SGD with momentum, weight decay, and gradient clipping; optimizer state saves to a file and restores in memory, plus AdamW from candle |
 | `sched` | learning rate schedulers: StepLR, ExponentialLR, CosineAnnealingLR, Warmup, OneCycleLR |
+| `lr_finder` | LR range test: loss and gradient norm over a growing lr, weights restored after the run |
 | `checkpoint` | best model tracking, early stopping, and optimizer state |
 | `loss` | cross entropy, MSE, Huber, binary cross entropy with logits |
 | `data` | xor and two spirals generators, a CSV loader, train/test split, mini batches |
@@ -225,7 +242,7 @@ A CUDA Toolkit installation is required: candle compiles its kernels during the 
 |------|---------|--------|
 | XOR | 2-16-2, tanh | accuracy 1.000, loss 0.002 in 300 epochs |
 | two spirals | 2-64-64-2, relu | test accuracy 1.000 in 800 epochs |
-| marker in a sequence | embedding 8 + MLP 64-32-2 | test accuracy 1.000, macro F1 1.000 in 300 epochs |
+| marker in a sequence | embedding 8 + GRU 24 + linear 2 | test accuracy 1.000, macro F1 1.000 in 200 epochs |
 | MNIST | 784-128-10, relu | test accuracy 0.972 in 5 epochs |
 | MNIST CNN | 8-5x5 and 16-5x5 with maxpool | test accuracy 0.985 in 5 epochs |
 
@@ -331,7 +348,21 @@ let weight = Var::from_tensor(&Tensor::randn(0f32, 0.1f32, (vocab, 8), &device)?
 let embedded = embedding(weight.as_tensor(), &tokens)?;
 ```
 
-Indices of the shape (N, length) produce (N, length, size), followed by flatten in front of the linear layers. examples/sequence.rs assembles a sequence classifier from this: it detects whether a marker token occurred at least twice, trains through fit with clipping, and prints the per-class metrics.
+Indices of the shape (N, length) produce (N, length, size), followed by flatten in front of the linear layers.
+
+## Recurrent networks
+
+rnn and gru add recurrent layers. The input has the shape (batch, length, features), the output carries the hidden states of every step (batch, length, hidden), and the initial state is zero:
+
+```rust
+model.gru(8, 24)?;
+model.select_last_step();
+model.linear(24, 2)?;
+```
+
+select_last_step cuts (N, length, F) down to the final step (N, F) — the bridge from a recurrent layer to an ordinary classifier. rnn is a tanh recurrence h = tanh(W_xh x + W_hh h + b), gru is a gated cell with update and reset gates that holds long range dependencies more reliably.
+
+In save/load the layers travel under their own architecture codes and the weights come back whole with the rest of the model. examples/sequence.rs detects from a token sequence whether a marker occurred at least twice: embedding turns indices into vectors, gru reads the sequence, select_last_step keeps the final step, a linear layer produces the classes, and training runs through fit with clipping.
 
 ## Gradient checking
 
@@ -356,7 +387,7 @@ examples/bench.rs measures f32 matmul. On two Xeon cores it reaches 140-160 GFLO
 cargo test
 ```
 
-Ninety-nine tests: Adam and SGD steps with weight decay and gradient clipping are checked against hand computed values, clipping cuts by the global norm across all parameters, the state of both optimizers is saved to a file and continues the trajectory where it stopped, the schedulers produce exact schedules and really move the optimizer lr, fit produces identical histories for one seed and really trains xor, the gradient check passes on linear and convolutional architectures, including the transposed convolution, batch_norm, every kind of pooling, and the standalone embedding and conv_transpose2d functions, avg_pool, global_avg_pool, adaptive_avg_pool, and adaptive_max_pool are checked against hand computed values, including inputs that are not evenly divisible, a network with a transposed convolution learns upsampling, xor, spirals, and a convolutional network with batch_norm actually train, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly, dropout zeroes out the expected fraction of neurons, the CSV loader parses quoted fields and reports broken rows, Checkpointer and EarlyStopping keep the best model, early stopping fires on patience and min_delta, and the confusion matrix and per-class metrics match hand computed values. GitHub Actions runs fmt, clippy, and the tests on every push.
+One hundred eleven tests: Adam and SGD steps with weight decay and gradient clipping are checked against hand computed values, clipping cuts by the global norm across all parameters, the gradient norm is recorded on every step, the state of both optimizers is saved to a file and restored in memory, the schedulers produce exact schedules and really move the optimizer lr, LrFinder sweeps the lr geometrically, stops on a loss explosion, and hands the model and the optimizer their original state back, fit produces identical histories for one seed and really trains xor, the gradient check passes on linear and convolutional architectures, including the transposed convolution, batch_norm, every kind of pooling, and the standalone embedding and conv_transpose2d functions, the recurrent layers are checked against numerical differentiation through time, avg_pool, global_avg_pool, adaptive_avg_pool, and adaptive_max_pool are checked against hand computed values, including inputs that are not evenly divisible, a network with a transposed convolution learns upsampling, xor, spirals, and a convolutional network with batch_norm actually train, a gru remembers the first symbol of a sequence and an rnn learns a rule about the last step, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly and carries its running statistics through save/load, dropout zeroes out the expected fraction of neurons, the CSV loader parses quoted fields and reports broken rows, Checkpointer and EarlyStopping keep the best model, early stopping fires on patience and min_delta, and the confusion matrix and per-class metrics match hand computed values. GitHub Actions runs fmt, clippy, and the tests on every push.
 
 ## MNIST
 
