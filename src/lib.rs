@@ -17,7 +17,9 @@ pub fn device() -> candle::Result<Device> {
 }
 
 pub mod prelude {
-    pub use crate::data::{Dataset, batch_indices, spirals, xor};
+    pub use crate::data::{
+        CsvConfig, Dataset, batch_indices, load_csv, load_csv_named, load_csv_with, spirals, xor,
+    };
     pub use crate::device;
     pub use crate::gradcheck::{GradCheckConfig, GradReport, check, check_model};
     pub use crate::loss::{binary_cross_entropy_with_logit, cross_entropy, huber, mse};
