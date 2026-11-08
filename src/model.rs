@@ -136,6 +136,45 @@ pub fn max_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
         .max(D::Minus1)
 }
 
+pub fn conv_transpose2d(
+    xs: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    stride: usize,
+    padding: usize,
+) -> Result<Tensor> {
+    let (_, in_c, _, _) = xs.dims4()?;
+    let (w_in, w_out, k_h, k_w) = weight.dims4()?;
+    if w_in != in_c {
+        candle::bail!("weight expects {w_in} input channels, input has {in_c}");
+    }
+    if k_h != k_w {
+        candle::bail!("rectangular kernel {k_h}x{k_w} is not supported");
+    }
+    let out = xs.conv_transpose2d(weight, padding, 0, stride, 1)?;
+    match bias {
+        None => Ok(out),
+        Some(b) => {
+            let channels = b.dims1()?;
+            if channels != w_out {
+                candle::bail!("bias expects {w_out} channels, got {channels}");
+            }
+            out.broadcast_add(&b.reshape((1, channels, 1, 1))?)
+        }
+    }
+}
+
+pub fn embedding(weight: &Tensor, indices: &Tensor) -> Result<Tensor> {
+    if weight.dims().len() != 2 {
+        candle::bail!("embedding weight must be a (vocab, dim) matrix");
+    }
+    let mut shape = indices.dims().to_vec();
+    shape.push(weight.dim(D::Minus1)?);
+    weight
+        .index_select(&indices.flatten_all()?, 0)?
+        .reshape(shape)
+}
+
 #[derive(Debug)]
 struct BatchNorm {
     running_mean: Var,
@@ -422,7 +461,11 @@ impl Model {
     }
 
     pub fn vars(&self) -> Vec<Var> {
-        self.varmap.all_vars()
+        let data = self.varmap.data().lock().expect("varmap poisoned");
+        let mut named: Vec<(String, Var)> =
+            data.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        named.into_iter().map(|(_, v)| v).collect()
     }
 
     pub fn varmap(&self) -> &VarMap {

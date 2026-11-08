@@ -54,7 +54,7 @@ fn main() -> candle::Result<()> {
 }
 ```
 
-forward builds the computation graph, cross_entropy returns a scalar, and backward_step computes gradients and updates the parameters. The library has no sessions, no compilation stages, and no separate train function.
+forward builds the computation graph, cross_entropy returns a scalar, and backward_step computes gradients and updates the parameters. The library has no sessions and no compilation stages.
 
 ## Learning rate schedulers
 
@@ -103,6 +103,27 @@ opt.set_max_grad_norm(Some(0.5));
 
 last_grad_norm returns the gradient norm of the latest step when clipping is on — a handy value to watch for spikes in the training log.
 
+## Mini batches
+
+fit assembles a training loop out of mini batches: it shuffles the indices with a seed, cuts them into batches, computes the loss, and takes an optimizer step, returning the average loss of every epoch:
+
+```rust
+let history = fit(
+    &mut opt,
+    |xb, yb| cross_entropy(&model.forward(xb)?, yb),
+    &x,
+    &y,
+    FitConfig {
+        epochs: 300,
+        batch_size: 64,
+        shuffle: true,
+        seed: 42,
+    },
+)?;
+```
+
+The closure receives a batch of features and a batch of labels — the forward pass and any preparation such as embeddings happen right there. shuffle turns off the shuffling, seed makes the split reproducible, and history is ready for a training plot.
+
 ## Convolutional networks
 
 conv2d adds a convolutional layer, max_pool and avg_pool shrink the feature maps, and flatten unfolds them into a vector before the linear layers:
@@ -131,6 +152,8 @@ model.tanh();
 ```
 
 The convolution shrinks, the transposed one expands, together they form an encoder and a decoder. In save/load the layer is stored under its architecture code with its stride and padding, so the model is restored in full. examples/autoencoder.rs trains such an autoencoder: a conv2d encoder squeezes an 8×8 image down to 4×2×2 and a conv_transpose2d decoder restores it, MSE drops from about 0.76 to 0.001 in 500 epochs.
+
+The convolution is also available as a standalone function on a tensor, without a model: conv_transpose2d(input, weight, bias, stride, padding) takes a weight of shape (input channels, output channels, kernel, kernel) and checks that the sizes agree.
 
 adaptive_avg_pool and adaptive_max_pool bring a feature map to a given output size regardless of the input: the window and the step are chosen automatically, and the input can be of any size, even smaller than the output. This is handy in front of a classifier for images of arbitrary sizes:
 
@@ -185,12 +208,13 @@ A CUDA Toolkit installation is required: candle compiles its kernels during the 
 
 | Module | What it does |
 |--------|--------------|
-| `model` | Linear, Conv2d, ConvTranspose2d, batch_norm, max_pool, avg_pool, adaptive_avg_pool, adaptive_max_pool, global_avg_pool, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
+| `model` | Linear, Conv2d, ConvTranspose2d, embedding, batch_norm, max_pool, avg_pool, adaptive_avg_pool, adaptive_max_pool, global_avg_pool, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
 | `optim` | Adam and SGD with momentum, weight decay, and gradient clipping, plus AdamW from candle |
 | `sched` | learning rate schedulers: StepLR, ExponentialLR, CosineAnnealingLR, Warmup, OneCycleLR |
-| `checkpoint` | best model tracking and early stopping by metric |
+| `checkpoint` | best model tracking, early stopping, and optimizer state |
 | `loss` | cross entropy, MSE, Huber, binary cross entropy with logits |
 | `data` | xor and two spirals generators, a CSV loader, train/test split, mini batches |
+| `fit` | a training loop over mini batches with seeded shuffling |
 | `gradcheck` | analytical gradients checked against numerical ones |
 | `metrics` | argmax, accuracy, confusion matrix, precision, recall, F1 |
 | `mnist` | MNIST loader behind the `mnist` feature |
@@ -201,6 +225,7 @@ A CUDA Toolkit installation is required: candle compiles its kernels during the 
 |------|---------|--------|
 | XOR | 2-16-2, tanh | accuracy 1.000, loss 0.002 in 300 epochs |
 | two spirals | 2-64-64-2, relu | test accuracy 1.000 in 800 epochs |
+| marker in a sequence | embedding 8 + MLP 64-32-2 | test accuracy 1.000, macro F1 1.000 in 300 epochs |
 | MNIST | 784-128-10, relu | test accuracy 0.972 in 5 epochs |
 | MNIST CNN | 8-5x5 and 16-5x5 with maxpool | test accuracy 0.985 in 5 epochs |
 
@@ -270,6 +295,16 @@ let model = Model::load("best.safetensors", &device)?;
 
 best returns the best metric, bad_epochs counts the epochs without improvement in a row, and stopped tells whether the training was stopped.
 
+Checkpointer can save the optimizer state together with the model: update_with_optimizer writes the Adam moments or the SGD momentum buffers along with the config into the same file, and Model::load simply ignores those keys. To resume, restore the model as usual, create the optimizer fresh, and let it read its state from the same file:
+
+```rust
+let model = Model::load("best.safetensors", &device)?;
+let mut opt = Adam::new_lr(model.vars(), 0.02)?;
+opt.load_state("best.safetensors")?;
+```
+
+The Adam moments and the step counter are picked up where the training stopped, so the run continues as if it had never been interrupted. save_state and load_state also work on their own, and EarlyStopping knows update_with_optimizer too.
+
 ## Classification metrics
 
 confusion_matrix builds the confusion matrix: rows are the true classes, columns are the predicted ones. per_class_metrics breaks it down into precision, recall, F1, and support per class, and macro_f1 averages F1 across classes:
@@ -286,6 +321,17 @@ println!("macro f1 {:.3}", macro_f1(&matrix));
 ```
 
 A class with no predictions and no examples yields zero precision, recall, and F1 instead of a division by zero.
+
+## Embeddings and sequences
+
+embedding picks rows out of a weight matrix by token indices, and the indices can have any shape:
+
+```rust
+let weight = Var::from_tensor(&Tensor::randn(0f32, 0.1f32, (vocab, 8), &device)?)?;
+let embedded = embedding(weight.as_tensor(), &tokens)?;
+```
+
+Indices of the shape (N, length) produce (N, length, size), followed by flatten in front of the linear layers. examples/sequence.rs assembles a sequence classifier from this: it detects whether a marker token occurred at least twice, trains through fit with clipping, and prints the per-class metrics.
 
 ## Gradient checking
 
@@ -310,7 +356,7 @@ examples/bench.rs measures f32 matmul. On two Xeon cores it reaches 140-160 GFLO
 cargo test
 ```
 
-Eighty tests: Adam and SGD steps with weight decay and gradient clipping are checked against hand computed values, clipping cuts by the global norm across all parameters, the schedulers produce exact schedules and really move the optimizer lr, the gradient check passes on linear and convolutional architectures, including the transposed convolution, batch_norm, and every kind of pooling, avg_pool, global_avg_pool, adaptive_avg_pool, and adaptive_max_pool are checked against hand computed values, including inputs that are not evenly divisible, a network with a transposed convolution learns upsampling, xor, spirals, and a convolutional network with batch_norm actually train, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly, dropout zeroes out the expected fraction of neurons, the CSV loader parses quoted fields and reports broken rows, Checkpointer and EarlyStopping keep the best model, early stopping fires on patience and min_delta, and the confusion matrix and per-class metrics match hand computed values. GitHub Actions runs fmt, clippy, and the tests on every push.
+Ninety-nine tests: Adam and SGD steps with weight decay and gradient clipping are checked against hand computed values, clipping cuts by the global norm across all parameters, the state of both optimizers is saved to a file and continues the trajectory where it stopped, the schedulers produce exact schedules and really move the optimizer lr, fit produces identical histories for one seed and really trains xor, the gradient check passes on linear and convolutional architectures, including the transposed convolution, batch_norm, every kind of pooling, and the standalone embedding and conv_transpose2d functions, avg_pool, global_avg_pool, adaptive_avg_pool, and adaptive_max_pool are checked against hand computed values, including inputs that are not evenly divisible, a network with a transposed convolution learns upsampling, xor, spirals, and a convolutional network with batch_norm actually train, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly, dropout zeroes out the expected fraction of neurons, the CSV loader parses quoted fields and reports broken rows, Checkpointer and EarlyStopping keep the best model, early stopping fires on patience and min_delta, and the confusion matrix and per-class metrics match hand computed values. GitHub Actions runs fmt, clippy, and the tests on every push.
 
 ## MNIST
 

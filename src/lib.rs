@@ -1,5 +1,6 @@
 pub mod checkpoint;
 pub mod data;
+pub mod fit;
 pub mod gradcheck;
 pub mod loss;
 pub mod metrics;
@@ -24,15 +25,19 @@ pub mod prelude {
         CsvConfig, Dataset, batch_indices, load_csv, load_csv_named, load_csv_with, spirals, xor,
     };
     pub use crate::device;
+    pub use crate::fit::{FitConfig, fit};
     pub use crate::gradcheck::{GradCheckConfig, GradReport, check, check_model};
     pub use crate::loss::{binary_cross_entropy_with_logit, cross_entropy, huber, mse};
     pub use crate::metrics::{
         ClassMetrics, accuracy, argmax, confusion_matrix, macro_f1, per_class_metrics,
     };
     pub use crate::model::{
-        Act, Model, adaptive_avg_pool, adaptive_max_pool, avg_pool, global_avg_pool, max_pool,
+        Act, Model, adaptive_avg_pool, adaptive_max_pool, avg_pool, conv_transpose2d, embedding,
+        global_avg_pool, max_pool,
     };
-    pub use crate::optim::{Adam, AdamConfig, AdamW, Optimizer, ParamsAdamW, SGD, SgdConfig};
+    pub use crate::optim::{
+        Adam, AdamConfig, AdamW, Optimizer, OptimizerState, ParamsAdamW, SGD, SgdConfig,
+    };
     pub use crate::sched::{
         CosineAnnealingLR, ExponentialLR, LrScheduler, OneCycleLR, StepLR, Warmup,
     };

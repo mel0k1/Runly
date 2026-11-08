@@ -107,6 +107,42 @@ fn adaptive_max_pool_gradients_match_numerical() -> Result<()> {
 }
 
 #[test]
+fn standalone_conv_transpose_gradients_match_numerical() -> Result<()> {
+    let device = Device::Cpu;
+    let weight = Var::from_tensor(&Tensor::randn(0f32, 1f32, (1, 2, 2, 2), &device)?)?;
+    let x = Tensor::randn(0f32, 1f32, (2, 1, 2, 2), &device)?;
+    let reports = check(
+        &[("weight".to_string(), weight.clone())],
+        || {
+            conv_transpose2d(&x, weight.as_tensor(), None, 2, 0)?
+                .sqr()?
+                .sum_all()
+        },
+        GradCheckConfig::default(),
+    )?;
+    for report in &reports {
+        assert!(report.ok, "{} max_err {:.2e}", report.name, report.max_err);
+    }
+    Ok(())
+}
+
+#[test]
+fn embedding_gradients_match_numerical() -> Result<()> {
+    let device = Device::Cpu;
+    let weight = Var::from_tensor(&Tensor::randn(0f32, 1f32, (4, 3), &device)?)?;
+    let indices = Tensor::from_vec(vec![0u32, 2, 3, 2], 4, &device)?;
+    let reports = check(
+        &[("weight".to_string(), weight.clone())],
+        || embedding(weight.as_tensor(), &indices)?.sqr()?.sum_all(),
+        GradCheckConfig::default(),
+    )?;
+    for report in &reports {
+        assert!(report.ok, "{} max_err {:.2e}", report.name, report.max_err);
+    }
+    Ok(())
+}
+
+#[test]
 fn batch_norm_gradients_match_numerical() -> Result<()> {
     let device = Device::Cpu;
     let mut model = Model::new(&device);

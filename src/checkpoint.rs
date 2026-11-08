@@ -1,4 +1,5 @@
 use crate::model::Model;
+use crate::optim::OptimizerState;
 use candle::Result;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,26 @@ impl Checkpointer {
     pub fn update(&mut self, model: &Model, metric: f64) -> Result<bool> {
         if self.best.is_none_or(|best| metric < best) {
             model.save(&self.path)?;
+            self.best = Some(metric);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn update_with_optimizer<O: OptimizerState>(
+        &mut self,
+        model: &Model,
+        opt: &O,
+        metric: f64,
+    ) -> Result<bool> {
+        if self.best.is_none_or(|best| metric < best) {
+            model.save(&self.path)?;
+            let mut tensors = candle::safetensors::load(&self.path, model.device())?;
+            for (name, tensor) in opt.state_tensors()? {
+                tensors.insert(name, tensor);
+            }
+            candle::safetensors::save(&tensors, &self.path)?;
             self.best = Some(metric);
             Ok(true)
         } else {
@@ -69,6 +90,32 @@ impl EarlyStopping {
         };
         if improved {
             self.checkpointer.update(model, metric)?;
+            self.bad_epochs = 0;
+        } else {
+            self.bad_epochs += 1;
+            if self.bad_epochs >= self.patience {
+                self.stopped = true;
+            }
+        }
+        Ok(self.stopped)
+    }
+
+    pub fn update_with_optimizer<O: OptimizerState>(
+        &mut self,
+        model: &Model,
+        opt: &O,
+        metric: f64,
+    ) -> Result<bool> {
+        if self.stopped {
+            return Ok(true);
+        }
+        let improved = match self.checkpointer.best() {
+            None => true,
+            Some(best) => metric < best - self.min_delta,
+        };
+        if improved {
+            self.checkpointer
+                .update_with_optimizer(model, opt, metric)?;
             self.bad_epochs = 0;
         } else {
             self.bad_epochs += 1;

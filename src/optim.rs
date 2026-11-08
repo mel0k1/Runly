@@ -1,6 +1,42 @@
 use candle::backprop::GradStore;
-use candle::{Result, Var};
+use candle::{Device, Result, Tensor, Var};
 pub use candle_nn::optim::Optimizer;
+use std::collections::HashMap;
+use std::path::Path;
+
+pub trait OptimizerState {
+    fn state_tensors(&self) -> Result<HashMap<String, Tensor>>;
+
+    fn save_state<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        candle::safetensors::save(&self.state_tensors()?, path)
+    }
+
+    fn load_state<P: AsRef<Path>>(&mut self, path: P) -> Result<()>;
+}
+
+fn state_device(states: &[&Var]) -> Device {
+    states
+        .first()
+        .map(|v| v.device().clone())
+        .unwrap_or(Device::Cpu)
+}
+
+fn put_scalar(
+    map: &mut HashMap<String, Tensor>,
+    name: &str,
+    value: f64,
+    device: &Device,
+) -> Result<()> {
+    map.insert(name.to_string(), Tensor::from_vec(vec![value], 1, device)?);
+    Ok(())
+}
+
+fn read_scalar(tensors: &HashMap<String, Tensor>, name: &str, path: &Path) -> Result<f64> {
+    let tensor = tensors
+        .get(name)
+        .ok_or_else(|| candle::Error::Msg(format!("missing {name} in {}", path.display())))?;
+    Ok(tensor.to_vec1::<f64>()?[0])
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct AdamConfig {
@@ -154,6 +190,80 @@ impl Adam {
     pub fn last_grad_norm(&self) -> Option<f64> {
         self.last_norm
     }
+
+    pub fn config(&self) -> &AdamConfig {
+        &self.config
+    }
+}
+
+impl OptimizerState for Adam {
+    fn state_tensors(&self) -> Result<HashMap<String, Tensor>> {
+        let vars: Vec<&Var> = self.states.iter().map(|s| &s.var).collect();
+        let device = state_device(&vars);
+        let mut map = HashMap::new();
+        let n_steps = self.step_t as f64;
+        put_scalar(&mut map, "meta.step", n_steps, &device)?;
+        let c = self.config;
+        put_scalar(&mut map, "config.lr", c.lr, &device)?;
+        put_scalar(&mut map, "config.beta1", c.beta1, &device)?;
+        put_scalar(&mut map, "config.beta2", c.beta2, &device)?;
+        put_scalar(&mut map, "config.eps", c.eps, &device)?;
+        put_scalar(&mut map, "config.weight_decay", c.weight_decay, &device)?;
+        put_scalar(
+            &mut map,
+            "config.max_grad_norm",
+            c.max_grad_norm.unwrap_or(-1.0),
+            &device,
+        )?;
+        for (i, s) in self.states.iter().enumerate() {
+            map.insert(format!("adam.{i}.m"), s.m.as_tensor().clone());
+            map.insert(format!("adam.{i}.v"), s.v.as_tensor().clone());
+        }
+        Ok(map)
+    }
+
+    fn load_state<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let vars: Vec<&Var> = self.states.iter().map(|s| &s.var).collect();
+        let device = state_device(&vars);
+        let tensors = candle::safetensors::load(path, &device)?;
+        let mut stored = 0usize;
+        while tensors.contains_key(&format!("adam.{stored}.m")) {
+            stored += 1;
+        }
+        if stored != self.states.len() {
+            candle::bail!(
+                "{} holds {stored} optimizer states, optimizer has {}",
+                path.display(),
+                self.states.len()
+            );
+        }
+        for (i, s) in self.states.iter_mut().enumerate() {
+            let m = tensors.get(&format!("adam.{i}.m")).ok_or_else(|| {
+                candle::Error::Msg(format!("missing adam.{i}.m in {}", path.display()))
+            })?;
+            let v = tensors.get(&format!("adam.{i}.v")).ok_or_else(|| {
+                candle::Error::Msg(format!("missing adam.{i}.v in {}", path.display()))
+            })?;
+            s.m.set(m)?;
+            s.v.set(v)?;
+        }
+        let step = read_scalar(&tensors, "meta.step", path)?;
+        self.step_t = step as usize;
+        self.config = AdamConfig {
+            lr: read_scalar(&tensors, "config.lr", path)?,
+            beta1: read_scalar(&tensors, "config.beta1", path)?,
+            beta2: read_scalar(&tensors, "config.beta2", path)?,
+            eps: read_scalar(&tensors, "config.eps", path)?,
+            weight_decay: read_scalar(&tensors, "config.weight_decay", path)?,
+            max_grad_norm: match read_scalar(&tensors, "config.max_grad_norm", path)? {
+                v if v < 0.0 => None,
+                v => Some(v),
+            },
+        };
+        self.last_norm = None;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -265,6 +375,60 @@ impl SGD {
 
     pub fn last_grad_norm(&self) -> Option<f64> {
         self.last_norm
+    }
+
+    pub fn config(&self) -> &SgdConfig {
+        &self.config
+    }
+}
+
+impl OptimizerState for SGD {
+    fn state_tensors(&self) -> Result<HashMap<String, Tensor>> {
+        let vars: Vec<&Var> = self.states.iter().map(|s| &s.var).collect();
+        let device = state_device(&vars);
+        let mut map = HashMap::new();
+        let c = self.config;
+        put_scalar(&mut map, "config.lr", c.lr, &device)?;
+        put_scalar(&mut map, "config.momentum", c.momentum, &device)?;
+        put_scalar(&mut map, "config.dampening", c.dampening, &device)?;
+        put_scalar(&mut map, "config.weight_decay", c.weight_decay, &device)?;
+        put_scalar(
+            &mut map,
+            "config.max_grad_norm",
+            c.max_grad_norm.unwrap_or(-1.0),
+            &device,
+        )?;
+        for (i, s) in self.states.iter().enumerate() {
+            if let Some(buf) = &s.buf {
+                map.insert(format!("sgd.{i}.buf"), buf.as_tensor().clone());
+            }
+        }
+        Ok(map)
+    }
+
+    fn load_state<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let vars: Vec<&Var> = self.states.iter().map(|s| &s.var).collect();
+        let device = state_device(&vars);
+        let tensors = candle::safetensors::load(path, &device)?;
+        for (i, s) in self.states.iter_mut().enumerate() {
+            s.buf = match tensors.get(&format!("sgd.{i}.buf")) {
+                Some(buf) => Some(Var::from_tensor(buf)?),
+                None => None,
+            };
+        }
+        self.config = SgdConfig {
+            lr: read_scalar(&tensors, "config.lr", path)?,
+            momentum: read_scalar(&tensors, "config.momentum", path)?,
+            dampening: read_scalar(&tensors, "config.dampening", path)?,
+            weight_decay: read_scalar(&tensors, "config.weight_decay", path)?,
+            max_grad_norm: match read_scalar(&tensors, "config.max_grad_norm", path)? {
+                v if v < 0.0 => None,
+                v => Some(v),
+            },
+        };
+        self.last_norm = None;
+        Ok(())
     }
 }
 
