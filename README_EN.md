@@ -56,9 +56,26 @@ fn main() -> candle::Result<()> {
 
 forward builds the computation graph, cross_entropy returns a scalar, and backward_step computes gradients and updates the parameters. The library has no sessions, no compilation stages, and no separate train function.
 
+## Learning rate schedulers
+
+A scheduler returns the learning rate for the current step and moves its internal counter; apply also sets it on the optimizer:
+
+```rust
+let mut opt = Adam::new_lr(model.vars(), 0.02)?;
+let mut sched = CosineAnnealingLR::new(0.02, 300, 1e-4)?;
+for epoch in 0..300 {
+    sched.apply(&mut opt);
+    let logits = model.forward(&x)?;
+    let loss = cross_entropy(&logits, &y)?;
+    opt.backward_step(&loss)?;
+}
+```
+
+Inside are StepLR, ExponentialLR, and CosineAnnealingLR: the first cuts the lr by gamma every step_size steps, the second multiplies it by gamma on every step, and the third follows a cosine from the base value down to eta_min over t_max steps. The current value comes from lr(), and a scheduler works with any optimizer that implements the Optimizer trait. examples/sched.rs trains xor with a cosine schedule and prints the lr as it goes.
+
 ## Convolutional networks
 
-conv2d adds a convolutional layer, max_pool shrinks the feature maps, and flatten unfolds them into a vector before the linear layers:
+conv2d adds a convolutional layer, max_pool and avg_pool shrink the feature maps, and flatten unfolds them into a vector before the linear layers:
 
 ```rust
 let mut model = Model::new(&device);
@@ -72,7 +89,7 @@ model.flatten();
 model.linear(16 * 7 * 7, 10)?;
 ```
 
-The conv2d arguments are input channels, output channels, kernel size, stride, and padding. The input has the shape (batch, channels, height, width), and the size must be divisible by the pooling kernel. max_pool also works as a standalone function on a tensor when you need pooling without a model.
+The conv2d arguments are input channels, output channels, kernel size, stride, and padding. The input has the shape (batch, channels, height, width), and the size must be divisible by the pooling kernel. max_pool takes the maximum in each window, avg_pool takes the average, and both work as standalone functions on a tensor when you need pooling without a model.
 
 The save/load pair stores the architecture description together with the stride and padding, so a convolutional model is restored from the file in full and is ready for further training.
 
@@ -119,8 +136,9 @@ A CUDA Toolkit installation is required: candle compiles its kernels during the 
 
 | Module | What it does |
 |--------|--------------|
-| `model` | Linear, Conv2d, batch_norm, max_pool, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
+| `model` | Linear, Conv2d, batch_norm, max_pool, avg_pool, dropout, flatten, and activations: relu, tanh, sigmoid, gelu, softmax |
 | `optim` | Adam and SGD with momentum, plus AdamW from candle |
+| `sched` | learning rate schedulers: StepLR, ExponentialLR, CosineAnnealingLR |
 | `loss` | cross entropy, MSE, Huber, binary cross entropy with logits |
 | `data` | xor and two spirals generators, a CSV loader, train/test split, mini batches |
 | `gradcheck` | analytical gradients checked against numerical ones |
@@ -191,7 +209,7 @@ examples/bench.rs measures f32 matmul. On two Xeon cores it reaches 140-160 GFLO
 cargo test
 ```
 
-Twenty-one tests: Adam and SGD steps are checked against hand computed values, the gradient check passes on linear and convolutional architectures, batch_norm, and pooling, xor, spirals, and a convolutional network with batch_norm actually train, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly, dropout zeroes out the expected fraction of neurons, and the CSV loader parses quoted fields and reports broken rows. GitHub Actions runs fmt, clippy, and the tests on every push.
+Thirty-four tests: Adam and SGD steps are checked against hand computed values, the schedulers produce exact schedules and really move the optimizer lr, the gradient check passes on linear and convolutional architectures, batch_norm, and both kinds of pooling, avg_pool is checked against hand computed values, xor, spirals, and a convolutional network with batch_norm actually train, saved weights round trip in f32 and f16 without distortion, batch_norm switches between training and inference correctly, dropout zeroes out the expected fraction of neurons, and the CSV loader parses quoted fields and reports broken rows. GitHub Actions runs fmt, clippy, and the tests on every push.
 
 ## MNIST
 
@@ -201,10 +219,6 @@ cargo run --release --features mnist --example cnn
 ```
 
 The `mnist` feature adds a loader: on the first run it downloads four files (about 11 MB) into the data folder, unpacks them, and builds tensors. mnist trains a perceptron, cnn solves the same task with a convolutional network.
-
-## Roadmap
-
-Learning rate schedulers, avg_pool. If something here matters to you, open an issue.
 
 ## License
 
