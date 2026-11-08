@@ -191,11 +191,15 @@ impl Model {
     }
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.save_as(path, DType::F32)
+    }
+
+    pub fn save_as<P: AsRef<Path>>(&self, path: P, dtype: DType) -> Result<()> {
         let mut map: HashMap<String, Tensor> = HashMap::new();
         {
             let data = self.varmap.data().lock().expect("varmap poisoned");
             for (name, var) in data.iter() {
-                map.insert(name.clone(), var.as_tensor().clone());
+                map.insert(name.clone(), var.as_tensor().to_dtype(dtype)?);
             }
         }
         let mut arch: Vec<u32> = Vec::with_capacity(self.layers.len());
@@ -232,8 +236,17 @@ impl Model {
         candle::safetensors::save(&map, path)
     }
 
+    pub fn save_half<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.save_as(path, DType::F16)
+    }
+
     pub fn load<P: AsRef<Path>>(path: P, device: &Device) -> Result<Self> {
-        let tensors = candle::safetensors::load(path.as_ref(), device)?;
+        let mut tensors = candle::safetensors::load(path.as_ref(), device)?;
+        for tensor in tensors.values_mut() {
+            if tensor.dtype().is_float() && tensor.dtype() != DType::F32 {
+                *tensor = tensor.to_dtype(DType::F32)?;
+            }
+        }
         let mut indices: Vec<usize> = tensors
             .keys()
             .filter_map(|key| {

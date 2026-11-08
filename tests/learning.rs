@@ -169,6 +169,44 @@ fn conv_model_learns_and_roundtrips() -> Result<()> {
 }
 
 #[test]
+fn half_precision_roundtrip_keeps_predictions() -> Result<()> {
+    let device = Device::Cpu;
+    let data = xor(16, 0.1, 2);
+    let (x, y) = data.tensors(&device)?;
+    let mut model = Model::new(&device);
+    model.linear(2, 128)?;
+    model.tanh();
+    model.linear(128, 2)?;
+    let mut opt = Adam::new_lr(model.vars(), 0.05)?;
+    for _ in 0..200 {
+        let logits = model.forward(&x)?;
+        let loss = cross_entropy(&logits, &y)?;
+        opt.backward_step(&loss)?;
+    }
+    let full = std::env::temp_dir().join(format!("runly_f32_{}.safetensors", std::process::id()));
+    let half = std::env::temp_dir().join(format!("runly_f16_{}.safetensors", std::process::id()));
+    model.save(&full)?;
+    model.save_half(&half)?;
+    let full_size = std::fs::metadata(&full)?.len();
+    let half_size = std::fs::metadata(&half)?.len();
+    assert!(
+        half_size * 4 < full_size * 3,
+        "f16 file {half_size} bytes vs f32 file {full_size} bytes"
+    );
+    let loaded = Model::load(&half, &device)?;
+    let diff = (model.forward(&x)? - loaded.forward(&x)?)?
+        .abs()?
+        .sum_all()?
+        .to_scalar::<f32>()?;
+    assert!(diff < 5.0, "predictions diff {diff}");
+    let acc = accuracy(&loaded.forward(&x)?, &y)?;
+    assert!(acc >= 0.95, "loaded accuracy {acc}");
+    std::fs::remove_file(&full)?;
+    std::fs::remove_file(&half)?;
+    Ok(())
+}
+
+#[test]
 fn dataset_helpers_behave() {
     let d = xor(8, 0.1, 1);
     assert_eq!(d.len(), 32);
