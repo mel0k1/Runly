@@ -52,6 +52,7 @@ const CODE_FLATTEN: u32 = 8;
 const CODE_BATCH_NORM: u32 = 9;
 const CODE_DROPOUT: u32 = 10;
 const CODE_AVG_POOL: u32 = 11;
+const CODE_GLOBAL_AVG_POOL: u32 = 12;
 
 pub fn avg_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
     let (n, c, h, w) = xs.dims4()?;
@@ -65,6 +66,13 @@ pub fn avg_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
         .contiguous()?
         .reshape((n, c, oh, ow, kernel * kernel))?
         .mean(D::Minus1)
+}
+
+pub fn global_avg_pool(xs: &Tensor) -> Result<Tensor> {
+    if xs.dims().len() != 4 {
+        candle::bail!("global avg pool expects a (n, c, h, w) tensor");
+    }
+    xs.mean_keepdim((2, 3))
 }
 
 pub fn max_pool(xs: &Tensor, kernel: usize) -> Result<Tensor> {
@@ -139,6 +147,7 @@ enum Layer {
     BatchNorm(BatchNorm),
     MaxPool(usize),
     AvgPool(usize),
+    GlobalAvgPool,
     Flatten,
     Dropout(f64),
     Activation(Act),
@@ -242,6 +251,10 @@ impl Model {
         self.layers.push(Layer::AvgPool(kernel));
     }
 
+    pub fn global_avg_pool(&mut self) {
+        self.layers.push(Layer::GlobalAvgPool);
+    }
+
     pub fn batch_norm(&mut self, channels: usize) -> Result<()> {
         let index = self.param_index();
         let layer = self.batch_norm_at(index, channels, 0.1)?;
@@ -296,6 +309,7 @@ impl Model {
                 }
                 Layer::MaxPool(k) => max_pool(&out, *k)?,
                 Layer::AvgPool(k) => avg_pool(&out, *k)?,
+                Layer::GlobalAvgPool => global_avg_pool(&out)?,
                 Layer::Flatten => out.flatten_from(1)?,
                 Layer::Dropout(p) => {
                     if train {
@@ -366,6 +380,7 @@ impl Model {
                     arch.push(CODE_AVG_POOL);
                     args.push(*k as u32);
                 }
+                Layer::GlobalAvgPool => arch.push(CODE_GLOBAL_AVG_POOL),
                 Layer::BatchNorm(b) => {
                     arch.push(CODE_BATCH_NORM);
                     args.push((b.momentum * 10000.0).round() as u32);
@@ -534,6 +549,7 @@ impl Model {
                     arg_index += 1;
                     model.layers.push(Layer::AvgPool(kernel));
                 }
+                CODE_GLOBAL_AVG_POOL => model.layers.push(Layer::GlobalAvgPool),
                 CODE_BATCH_NORM => {
                     if arg_index >= args.len() {
                         candle::bail!("batch_norm layer has no momentum in meta.args");
